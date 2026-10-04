@@ -28,6 +28,7 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 // How this module talks to a distribution point: the ceiling on one fetch, and how far a
@@ -325,10 +326,80 @@ func (v *CRLVerifier) logOnceLevel(key string, first zapcore.Level) (zapcore.Lev
 	return first, true
 }
 
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler:
+//
+//	verifier crl <file>... {
+//		crl_file <path>
+//		crl_url  <url>
+//		timeout  <duration>
+//	}
+//
+// The crl_file and crl_url subdirectives may be repeated to load more than one CRL, as may the
+// inline file arguments.
+func (v *CRLVerifier) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	d.Next() // consume the module name
+
+	// A file may be given inline, which is what most operators need: a path to a list they
+	// already export. Everything else is a subdirective, and the nesting is taken from the
+	// dispenser rather than assumed to be zero, because this runs inside client_auth.
+	for d.NextArg() {
+		v.CRLFiles = append(v.CRLFiles, d.Val())
+	}
+	for nesting := d.Nesting(); d.NextBlock(nesting); {
+		switch d.Val() {
+		case "crl_file":
+			file, err := oneArg(d)
+			if err != nil {
+				return err
+			}
+			v.CRLFiles = append(v.CRLFiles, file)
+		case "crl_url":
+			rawURL, err := oneArg(d)
+			if err != nil {
+				return err
+			}
+			v.CRLURLs = append(v.CRLURLs, rawURL)
+		case "timeout":
+			dur, err := durationArg(d)
+			if err != nil {
+				return err
+			}
+			v.Timeout = caddy.Duration(dur)
+		default:
+			return d.Errf("unrecognized subdirective for the CRL verifier: %s", d.Val())
+		}
+	}
+	return nil
+}
+
+func oneArg(d *caddyfile.Dispenser) (string, error) {
+	if !d.NextArg() {
+		return "", d.ArgErr()
+	}
+	arg := d.Val()
+	if d.NextArg() {
+		return "", d.Errf("expected one argument, got an extra '%s'", d.Val())
+	}
+	return arg, nil
+}
+
+func durationArg(d *caddyfile.Dispenser) (time.Duration, error) {
+	arg, err := oneArg(d)
+	if err != nil {
+		return 0, err
+	}
+	dur, err := caddy.ParseDuration(arg)
+	if err != nil {
+		return 0, d.Errf("invalid duration '%s': %v", arg, err)
+	}
+	return dur, nil
+}
+
 // Interface guards
 var (
 	_ caddy.Provisioner         = (*CRLVerifier)(nil)
 	_ caddy.Validator           = (*CRLVerifier)(nil)
 	_ caddy.CleanerUpper        = (*CRLVerifier)(nil)
+	_ caddyfile.Unmarshaler     = (*CRLVerifier)(nil)
 	_ ClientCertificateVerifier = (*CRLVerifier)(nil)
 )

@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/x509"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 // provisionCRLVerifier provisions a verifier the way Caddy would and cleans it up when the test
@@ -75,6 +77,86 @@ func provisionCRLVerifierExpectError(t testing.TB, cfg *CRLVerifier) error {
 	}
 	cancel()
 	return err
+}
+
+// TestCRLVerifierCaddyfile covers the module's whole configuration language: files inline or with
+// crl_file, urls with crl_url, and a fetch timeout. Anything else is refused by name rather than
+// ignored, so a directive left over from an older draft fails at load instead of silently doing
+// nothing.
+func TestCRLVerifierCaddyfile(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		input   string
+		want    func(*CRLVerifier) error
+		wantErr bool
+	}{
+		{
+			name:  "inline file",
+			input: "crl /etc/caddy/issuing.crl",
+			want: func(v *CRLVerifier) error {
+				if len(v.CRLFiles) != 1 || v.CRLFiles[0] != "/etc/caddy/issuing.crl" {
+					return fmt.Errorf("crl_files = %v", v.CRLFiles)
+				}
+				if v.Timeout != 0 {
+					return fmt.Errorf("timeout = %v, want unset so the default applies", time.Duration(v.Timeout))
+				}
+				return nil
+			},
+		},
+		{
+			name: "block of subdirectives",
+			input: `crl {
+	crl_file /etc/caddy/issuing.crl
+	crl_file /etc/caddy/root.crl
+	crl_url http://pki.example.test/crl
+	timeout 5s
+}`,
+			want: func(v *CRLVerifier) error {
+				if len(v.CRLFiles) != 2 || v.CRLFiles[1] != "/etc/caddy/root.crl" {
+					return fmt.Errorf("crl_files = %v", v.CRLFiles)
+				}
+				if len(v.CRLURLs) != 1 || v.CRLURLs[0] != "http://pki.example.test/crl" {
+					return fmt.Errorf("crl_urls = %v", v.CRLURLs)
+				}
+				if time.Duration(v.Timeout) != 5*time.Second {
+					return fmt.Errorf("timeout = %v", time.Duration(v.Timeout))
+				}
+				return nil
+			},
+		},
+		{
+			// Inline paths are a shorthand for crl_file, so the two forms may be mixed.
+			name:  "inline files and subdirectives combine",
+			input: "crl /etc/caddy/a.crl {\n\tcrl_file /x.crl\n}",
+			want: func(v *CRLVerifier) error {
+				if len(v.CRLFiles) != 2 || v.CRLFiles[0] != "/etc/caddy/a.crl" || v.CRLFiles[1] != "/x.crl" {
+					return fmt.Errorf("crl_files = %v", v.CRLFiles)
+				}
+				return nil
+			},
+		},
+		{name: "unknown subdirective", input: "crl {\n\tfollow_the_peer yes\n}", wantErr: true},
+		{name: "a removed option is refused by name", input: "crl {\n\tcheck_chain false\n}", wantErr: true},
+		{name: "missing value", input: "crl {\n\tcrl_file\n}", wantErr: true},
+		{name: "bad duration", input: "crl {\n\ttimeout tomorrow\n}", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := caddyfile.NewTestDispenser(tc.input)
+			v := new(CRLVerifier)
+			err := v.UnmarshalCaddyfile(d)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected an error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if err == nil && tc.want != nil {
+				if problem := tc.want(v); problem != nil {
+					t.Error(problem)
+				}
+			}
+		})
+	}
 }
 
 // TestCRLVerifierDefaults pins the fetch timeout when it is not set and when it is, and that a value
