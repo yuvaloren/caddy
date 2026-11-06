@@ -30,9 +30,7 @@ import (
 	"testing"
 	"time"
 
-	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestCRLVerifierRevocation(t *testing.T) {
@@ -53,15 +51,11 @@ func TestCRLVerifierRevocation(t *testing.T) {
 			path := writeCRLDER(t, "issuing.crl", pki.crl(t, crlOptions{number: 1, revoked: tc.revoked}))
 			v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
 
-			if err := v.VerifyClientCertificate(rawDER(t, good), pki.chainsFor(good)); err != nil {
-				t.Errorf("a certificate which is not revoked was refused: %v", err)
-			}
-			err := v.VerifyClientCertificate(rawDER(t, bad), pki.chainsFor(bad))
-			if tc.wantErr && err == nil {
-				t.Error("expected a revoked certificate to be refused, but it was admitted")
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("expected admission, got: %v", err)
+			pki.requireAdmitted(t, v, good, "a certificate which is not revoked was refused")
+			if tc.wantErr {
+				pki.requireRefused(t, v, bad, "expected a revoked certificate to be refused, but it was admitted")
+			} else {
+				pki.requireAdmitted(t, v, bad, "a certificate which no CRL mentions should be served")
 			}
 		})
 	}
@@ -74,14 +68,12 @@ func TestCRLVerifierNoCertificateAndNoChain(t *testing.T) {
 
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
 
-	// Whether a client may present no certificate at all is the client_auth mode's business.
+	// presenting no certificate is the client_auth mode's business
 	if err := v.VerifyClientCertificate(nil, nil); err != nil {
 		t.Errorf("presenting no certificate should be left to the mode, got: %v", err)
 	}
 
-	// A presented certificate with no verified chain must not pass: under a mode which does not
-	// build chains, and under verify_if_given for a certificate which does not verify, this is
-	// the only place that can be noticed.
+	// a presented certificate with no verified chain must not pass
 	if err := v.VerifyClientCertificate(rawDER(t, client), nil); err == nil {
 		t.Error("a presented certificate with no verified chain was admitted")
 	}
@@ -95,26 +87,18 @@ func TestCRLVerifierUnprovisionedRefuses(t *testing.T) {
 	client, _ := pki.leaf(t, 5500)
 
 	v := new(CRLVerifier)
-	if err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client)); err == nil {
-		t.Error("a verifier which never loaded a CRL admitted a certificate")
-	}
+	pki.requireRefused(t, v, client, "a verifier which never loaded a CRL admitted a certificate")
 }
 
 func TestCRLVerifierForgedCRL(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	client, _ := pki.leaf(t, 6000)
 
-	// A CRL which names the issuing CA but is signed by some other key. It claims the issuer, so
-	// it cannot be waved through as "no CRL for this issuer", and it must not clear a revocation
-	// either: an empty list signed by nobody is exactly what makes a revoked certificate look
-	// valid.
+	// names the issuing CA but is signed by the root's key
 	forged := writeCRLDER(t, "forged.crl", pki.crl(t, crlOptions{issuer: pki.issCert, signer: pki.rootKey, number: 99}))
 
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{forged}})
-	err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client))
-	if err == nil {
-		t.Fatal("a CRL which does not verify against the chain was relied upon")
-	}
+	err := pki.requireRefused(t, v, client, "a CRL which does not verify against the chain was relied upon")
 	if !strings.Contains(err.Error(), "does not verify against the verified chain") {
 		t.Errorf("expected a signature failure to be named, got: %v", err)
 	}
@@ -123,16 +107,11 @@ func TestCRLVerifierForgedCRL(t *testing.T) {
 		strangerKey := newTestKey(t)
 		path := writeCRLDER(t, "forged.crl", pki.crl(t, crlOptions{issuer: pki.issCert, signer: strangerKey, number: 99}))
 		v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
-		if err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client)); err == nil {
-			t.Fatal("a CRL signed by an unrelated key was relied upon")
-		}
+		pki.requireRefused(t, v, client, "a CRL signed by an unrelated key was relied upon")
 	})
 
 	t.Run("a list whose issuer is not in the chain covers nothing", func(t *testing.T) {
-		// A CRL which claims a name, with a chain which does not hold that certificate: there is
-		// nothing to anchor it on. No list is reached, so no signature is asked about — what this
-		// pins is that an issuer the chain does not carry leaves no coverage rather than borrowing
-		// another CA's list, which is why the refusal is about coverage and not about a signature.
+		// the issuer is not in the chain, so the refusal is about coverage, not a signature
 		v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{forged}})
 		chain := [][]*x509.Certificate{{client, pki.rootCert}}
 		err := v.VerifyClientCertificate(rawDER(t, client), chain)
@@ -152,10 +131,7 @@ func TestCRLVerifierNotYetValid(t *testing.T) {
 	path := writeCRLDER(t, "issuing.crl", pki.crl(t, crlOptions{number: 1, thisUpdate: time.Now().Add(time.Hour)}))
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
 
-	err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client))
-	if err == nil {
-		t.Fatal("a CRL which is not valid yet was relied upon")
-	}
+	err := pki.requireRefused(t, v, client, "a CRL which is not valid yet was relied upon")
 	if !strings.Contains(err.Error(), "not valid until") {
 		t.Errorf("expected the reason to name validity, got: %v", err)
 	}
@@ -175,14 +151,12 @@ func TestCRLVerifierHandshake(t *testing.T) {
 		{name: "tls 1.2", min: tls.VersionTLS12, max: tls.VersionTLS12},
 	} {
 		t.Run(version.name, func(t *testing.T) {
-			// Each version gets its own list and its own verifier: the run below revokes the
-			// client's serial, and a second version which inherited that file would refuse the
-			// connection for the wrong reason.
+			// each version gets its own list, since the run below revokes the client
 			crlPath := filepath.Join(t.TempDir(), "issuing.crl")
 			writeCRL := func(entries ...x509.RevocationListEntry) {
 				t.Helper()
 				der := pki.crl(t, crlOptions{number: 1, revoked: entries})
-				if err := os.WriteFile(crlPath, pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der}), 0o600); err != nil {
+				if err := os.WriteFile(crlPath, pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: der}), 0o600); err != nil {
 					t.Fatalf("writing the CRL: %v", err)
 				}
 			}
@@ -197,9 +171,8 @@ func TestCRLVerifierHandshake(t *testing.T) {
 				ClientCAs:    pki.pool,
 				MinVersion:   version.min,
 				MaxVersion:   version.max,
-				// This is how client_auth installs a verifier: the check runs in VerifyConnection,
-				// which crypto/tls calls on every connection, resumed ones included. connpolicy.go
-				// moves an existing VerifyPeerCertificate hook into VerifyConnection for this reason.
+				// client_auth installs the verifier in VerifyConnection, which also runs
+				// on resumed connections
 				VerifyConnection: func(cs tls.ConnectionState) error {
 					resumed = cs.DidResume
 					return v.VerifyClientCertificate(rawDER(t, cs.PeerCertificates...), cs.VerifiedChains)
@@ -214,8 +187,7 @@ func TestCRLVerifierHandshake(t *testing.T) {
 				ClientSessionCache: tls.NewLRUClientSessionCache(8),
 			}
 
-			// Before revocation: two connections, the second of which must resume, so that a later
-			// denial cannot be explained away as a fresh full handshake.
+			// the second connection must resume, so the denial below is on a resumed session
 			if err := handshake(server, client); err != nil {
 				t.Fatalf("the first connection failed: %v", err)
 			}
@@ -229,7 +201,6 @@ func TestCRLVerifierHandshake(t *testing.T) {
 				t.Fatal("the second connection did not resume, so this test would not prove anything")
 			}
 
-			// Now revoke and reconnect, on the resumed session.
 			writeCRL(revokedEntry(20000))
 			if _, err := v.reload(false); err != nil {
 				t.Fatalf("reloading the CRL: %v", err)
@@ -239,8 +210,7 @@ func TestCRLVerifierHandshake(t *testing.T) {
 			if err == nil {
 				t.Fatal("a revoked certificate was admitted by the handshake")
 			}
-			// crypto/tls answers any VerifyConnection failure with bad_certificate; and the denial must
-			// arrive on a resumed session, else it would only prove that fresh handshakes are checked.
+			// crypto/tls answers a VerifyConnection failure with bad_certificate
 			if !resumed || !strings.Contains(err.Error(), "bad certificate") {
 				t.Errorf("expected a resumed session refused with a bad certificate, got resumed=%v: %v", resumed, err)
 			}
@@ -249,9 +219,7 @@ func TestCRLVerifierHandshake(t *testing.T) {
 }
 
 func TestCRLVerifierMultipleChains(t *testing.T) {
-	// A cross-signed intermediate: one key with a certificate from each of two roots, so that one
-	// client certificate has two valid chains. Revoking it on one path and taking the other is
-	// what any-chain semantics mean, so this pins the behaviour instead of leaving it to chance.
+	// a cross-signed intermediate: one key, two roots, two valid chains
 	rootAKey, rootACert := mintCA(t, "Cross Root A", caPair{}, nil)
 	rootBKey, rootBCert := mintCA(t, "Cross Root B", caPair{}, nil)
 
@@ -280,44 +248,34 @@ func TestCRLVerifierMultipleChains(t *testing.T) {
 		name         string
 		sources      []string
 		wantErr      bool
-		wantContains string // in the refusal, so that a verifier which refuses everything passes for the right reason
+		wantContains string // expected in the refusal
 	}{
 		{
-			// Only the cross-signing root of path A published a list, so neither path is covered and
-			// the leaf is refused as uncovered before either intermediate is examined — which is what
-			// wantContains pins. Coverage of every path is the precondition; revocation never gets
-			// to be the tie-breaker here.
+			// neither path is covered, so refused as uncovered before revocation is reached
 			name:         "the other path has no crl",
 			sources:      []string{crlA},
 			wantErr:      true,
 			wantContains: "no configured CRL covers",
 		},
 		{
-			// Chain B fully covered and clean. It does not rescue chain A: every path has to be
-			// clean, because the shortest path is always clean once a pool holds an issuing CA and
-			// its root together — admitting on that would leave nothing able to refuse. Revoking a
-			// cross-signed CA therefore means publishing for every path, as here.
+			// a clean path does not rescue a revoked one: every path must be clean
 			name:         "the other path has a crl which does not revoke it",
 			sources:      []string{crlA, crlB, writeCRLDER(t, "issuing-b.crl", crlSignedBy(t, interB, interKey))},
 			wantErr:      true,
 			wantContains: "revoked",
 		},
 		{
-			// Revoked on both paths, refused whatever else is true.
 			name: "both paths revoked it",
 			sources: []string{crlA,
 				writeCRLDER(t, "root-b-revoked.crl", crlSignedBy(t, rootBCert, rootBKey, interB.SerialNumber)),
-				// Both paths covered down to the leaf, so that what refuses here is the
-				// revocation of the intermediate and not a gap in coverage.
+				// both paths covered to the leaf, so the refusal is the revocation
 				writeCRLDER(t, "issuing-a.crl", crlSignedBy(t, interA, interKey)),
 				writeCRLDER(t, "issuing-b.crl", crlSignedBy(t, interB, interKey))},
 			wantErr:      true,
 			wantContains: "revoked",
 		},
 		{
-			// Every path covered and clean. Without this row the test is satisfied by a
-			// verifier which refuses everything, which is the failure mode an operator feels as
-			// a locked listener rather than the one it guards against.
+			// every path covered and clean; a verifier that refuses everything fails here
 			name: "neither path revoked it",
 			sources: []string{
 				writeCRLDER(t, "root-a-clean.crl", crlSignedBy(t, rootACert, rootAKey)),
@@ -345,19 +303,9 @@ func TestCRLVerifierMultipleChains(t *testing.T) {
 	}
 }
 
-// TestCRLVerifierHandshakeChainFromThePool is the shape of the outage this module exists to
-// prevent — an issuing CA revoked by its own root while every end-entity certificate it issued
-// still looks clean — and it is an integration test because what gets checked depends on how
-// crypto/tls assembles the chain, which is not something the module controls.
-//
-// What the trust pool holds turns out to be most of the story. A client that sends its
-// intermediate reaches the root whether or not the issuing CA is also in the pool, so everything in
-// the path is checked. A client that sends only its leaf stops at the first certificate the server
-// already trusts, and from there the root — the only key which could vouch for that CA's own CRL —
-// is not part of what the verifier is handed. The last subtest is that shape: the leaf is still
-// checked against its own CA's list, and the status of the CA above it is simply not something this
-// handshake can learn, which is why a deployment which means to enforce that publishes for a pool
-// from which Go can build to the root.
+// TestCRLVerifierHandshakeChainFromThePool checks an issuing CA revoked by its
+// root. What gets checked depends on the chain crypto/tls builds, which stops
+// at the first certificate the pool holds.
 func TestCRLVerifierHandshakeChainFromThePool(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	clientCert, clientKey := pki.leaf(t, 22000)
@@ -371,7 +319,7 @@ func TestCRLVerifierHandshakeChainFromThePool(t *testing.T) {
 	writeRootCRL := func(serials ...*big.Int) {
 		t.Helper()
 		der := crlSignedBy(t, pki.rootCert, pki.rootKey, serials...)
-		if err := os.WriteFile(rootPath, pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der}), 0o600); err != nil {
+		if err := os.WriteFile(rootPath, pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: der}), 0o600); err != nil {
 			t.Fatalf("writing the root CRL: %v", err)
 		}
 	}
@@ -380,7 +328,7 @@ func TestCRLVerifierHandshakeChainFromThePool(t *testing.T) {
 	writeIssuingCRL := func(entries ...x509.RevocationListEntry) {
 		t.Helper()
 		der := pki.crl(t, crlOptions{number: 2, revoked: entries})
-		if err := os.WriteFile(issuingPath, pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der}), 0o600); err != nil {
+		if err := os.WriteFile(issuingPath, pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: der}), 0o600); err != nil {
 			t.Fatalf("writing the issuing CRL: %v", err)
 		}
 	}
@@ -404,15 +352,12 @@ func TestCRLVerifierHandshakeChainFromThePool(t *testing.T) {
 		}
 		sent := [][]byte{clientCert.Raw}
 		if sendIntermediate {
-			// The leaf alone is what a client configured with only its own certificate sends, which
-			// is common enough to be the case worth testing against; sending the intermediate is the
-			// other shape, and the only way a server holding just a root can reach the CA below it.
+			// a client holding only its own certificate sends the leaf alone
 			sent = append(sent, pki.issCert.Raw)
 		}
 		client := &tls.Config{
 			Certificates: []tls.Certificate{{Certificate: sent, PrivateKey: clientKey}},
-			// The client verifies the server against the full pool; under test is how the server
-			// assembles the chain of *its* client from *its* trust pool.
+			// under test is how the server builds its client's chain from its own pool
 			RootCAs:    pki.pool,
 			ServerName: "localhost",
 		}
@@ -442,13 +387,11 @@ func TestCRLVerifierHandshakeChainFromThePool(t *testing.T) {
 			!strings.Contains(said.Error(), pki.issCert.Subject.CommonName) {
 			t.Errorf("expected the refusal to name the revoked issuing CA, got: %v", said)
 		}
-		// crypto/tls answers any VerifyConnection failure with bad_certificate (42).
 		if !strings.Contains(err.Error(), "bad certificate") {
 			t.Errorf("expected the peer to report a bad certificate, got: %v", err)
 		}
 
-		// Same pool, same client, revoked no more — so that the refusal above cannot be attributed
-		// to anything about the setup.
+		// un-revoke, so the refusal above was not a setup problem
 		writeRootCRL()
 		if _, err := full.reload(false); err != nil {
 			t.Fatalf("reloading the root CRL again: %v", err)
@@ -459,9 +402,7 @@ func TestCRLVerifierHandshakeChainFromThePool(t *testing.T) {
 	})
 
 	t.Run("a bundle in the pool still reaches the root for a client that sends its ca", func(t *testing.T) {
-		// Root and issuing together, which is what pointing trust_pool at a bundle produces. Go
-		// builds every path it can find, so the chain which stops at the issuing CA sits beside one
-		// that goes on to the root; the second one is what carries the enforcement below.
+		// root and issuing CA together: Go offers both the short and the full chain
 		var depth, chains int
 		var said error
 		if err := handshakeWith(full, pki.pool, true, &depth, &chains, &said); err != nil {
@@ -490,12 +431,8 @@ func TestCRLVerifierHandshakeChainFromThePool(t *testing.T) {
 	})
 
 	t.Run("a chain which stops at a directly trusted ca is checked only as far as it goes", func(t *testing.T) {
-		// The same pool with a client that sends only its leaf: crypto/tls ends the chain at the
-		// certificate it already trusts, so there is no path to the root and nothing above the
-		// issuing CA is in hand to be asked about. What is checked still has to be checked — the
-		// leaf's own revocation is refused here — and what cannot be checked is named rather than
-		// pretended to, since an operator reading "chains are checked" would otherwise believe CA
-		// revocation was enforced while nothing of the kind is happening.
+		// a client sending only its leaf gets a chain ending at the trusted issuing
+		// CA, so the root's word about that CA is out of reach
 		var depth, chains int
 		var said error
 		if err := handshakeWith(full, pki.pool, false, &depth, &chains, &said); err != nil {
@@ -514,11 +451,7 @@ func TestCRLVerifierHandshakeChainFromThePool(t *testing.T) {
 			t.Errorf("expected the revoked leaf to be refused on a short chain, got: %v (verifier said: %v)", err, said)
 		}
 
-		// The CA's own revocation is the other half: visible only on a chain which reaches its
-		// issuer. With the root saying the issuing CA is revoked, the short chain still answers from
-		// the leaf's own list — and the same client sending its intermediate, which gives Go the
-		// path to the root, is refused. A pool holding the issuing CA is what makes that difference,
-		// and it is why the documentation says to trust a self-signed root alone.
+		// the CA's own revocation is enforced only on a chain which reaches the root
 		writeIssuingCRL()
 		writeRootCRL(pki.issCert.SerialNumber)
 		if _, err := full.reload(false); err != nil {
@@ -538,29 +471,21 @@ func TestCRLVerifierHandshakeChainFromThePool(t *testing.T) {
 	})
 }
 
-// An uncovered refusal travels back to Go and no further: the handshake ends and nothing is
-// written. A deployment which loaded one CRL too few therefore turns every client away in silence —
-// measured on a listener whose trust pool named an issuing CA no loaded list spoke for, where good
-// certificates were refused with no log line at any level. So the first refusal per issuer is
-// announced at warning level, and the connections after it go to debug: the operator hears about it
-// once, loudly, rather than never or once per handshake.
+// An uncovered refusal reaches only crypto/tls, which ends the handshake in
+// silence, so the first refusal per issuer is a warning and later ones debug.
 func TestCRLVerifierUncoveredRefusalIsAnnouncedOncePerIssuer(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	leaf, _ := pki.leaf(t, 7452)
 
-	// A list for the root and none for the CA which signed this certificate: the half-configured
-	// deployment which locks a listener out, since the chain's issuer is covered by nothing.
+	// a list for the root and none for the issuing CA
 	path := writeCRLDER(t, "root.crl", pki.crl(t, crlOptions{issuer: pki.rootCert, signer: pki.rootKey, number: 1}))
 
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
-	core, logs := observer.New(zapcore.DebugLevel)
-	v.logger = zap.New(core)
+	logs := observeLogs(t, v, zapcore.DebugLevel)
 
 	raw, chains := rawDER(t, leaf), pki.chainsFor(leaf)
 	for range 3 {
-		if err := v.VerifyClientCertificate(raw, chains); err == nil {
-			t.Fatal("a certificate which no loaded CRL speaks for was admitted")
-		}
+		requireRefused(t, v, raw, chains, "a certificate which no loaded CRL speaks for was admitted")
 	}
 
 	got := logs.FilterMessage("rejecting a certificate which no configured CRL covers").All()
@@ -584,18 +509,14 @@ func TestCRLVerifierUncoveredRefusalIsAnnouncedOncePerIssuer(t *testing.T) {
 	}
 }
 
-// TestCRLVerifierDirectlyTrustedIssuer is what a trust pool which holds the issuing CA itself means
-// for the chain rule. Pointing trust_pool at a root-plus-issuing bundle makes crypto/x509 stop
-// verified chains at the issuing CA, and such a chain holds no certificate whose key could vouch for
-// a list about that CA — so the module checks what the chain can answer and goes no further. What
-// that costs is visible from the other side: a client which sends its issuing CA completes the chain
-// to the root, and then the root's word about that CA is enforced.
+// TestCRLVerifierDirectlyTrustedIssuer checks that a chain ending at a directly
+// trusted issuing CA is checked only as far as it goes.
 func TestCRLVerifierDirectlyTrustedIssuer(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	client, _ := pki.leaf(t, 7700)
 
 	rootCRL := createCRL(t, pki.rootCert, pki.rootKey, crlOptions{number: 1})
-	path := writeFile(t, "issuing.crl", writeCRLPEMBytes(pki.crl(t, crlOptions{number: 1}), rootCRL))
+	path := writeLists(t, "issuing.crl", pki.crl(t, crlOptions{number: 1}), rootCRL)
 
 	short := [][]*x509.Certificate{{client, pki.issCert}}
 	full := pki.chainsToRoot(client)
@@ -608,20 +529,14 @@ func TestCRLVerifierDirectlyTrustedIssuer(t *testing.T) {
 		t.Errorf("a complete chain with a list for every issuer should verify, got: %v", err)
 	}
 
-	// The root revoking the issuing CA: refused where the chain reaches the root, and still served on
-	// the short chain, which cannot be asked about it. A deployment which wants that revocation to
-	// bite trusts its root alone and has clients send their intermediate — or accepts that the
-	// shorter path is checked less.
+	// the root revoking the issuing CA bites only where the chain reaches the root
 	revokedIssuer := createCRL(t, pki.rootCert, pki.rootKey, crlOptions{
 		number:  2,
 		revoked: []x509.RevocationListEntry{revokedEntry(pki.issCert.SerialNumber.Int64())},
 	})
-	badPath := writeFile(t, "issuing.crl", writeCRLPEMBytes(pki.crl(t, crlOptions{number: 1}), revokedIssuer))
+	badPath := writeLists(t, "issuing.crl", pki.crl(t, crlOptions{number: 1}), revokedIssuer)
 	vetoed := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{badPath}})
-	err := vetoed.VerifyClientCertificate(rawDER(t, client), full)
-	if err == nil {
-		t.Fatal("an issuing CA its own root has revoked was served on a chain which reaches that root")
-	}
+	err := requireRefused(t, vetoed, rawDER(t, client), full, "an issuing CA its own root has revoked was served on a chain which reaches that root")
 	if !strings.Contains(err.Error(), "revoked") {
 		t.Errorf("the refusal should say the issuing CA is revoked, got: %v", err)
 	}
@@ -630,11 +545,8 @@ func TestCRLVerifierDirectlyTrustedIssuer(t *testing.T) {
 	}
 }
 
-// TestCRLVerifierSelfSignedClientCertificate is what the chain rule means at the top of a chain:
-// a certificate is asked about by the certificate above it, and one which vouches for itself has no
-// other answer available than its own list. A root therefore needs a current CRL of its own to be
-// the top of a checked chain — which is the same rule nginx's ssl_crl applies to every CA in the
-// path, and the same one which took a deployment down when a root stopped publishing.
+// TestCRLVerifierSelfSignedClientCertificate checks that a self-signed top of
+// chain answers only to its own list, so a root needs a current CRL.
 func TestCRLVerifierSelfSignedClientCertificate(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	_, selfID := mintCA(t, "Self-Signed Client", caPair{}, nil)
@@ -657,28 +569,19 @@ func TestCRLVerifierSelfSignedClientCertificate(t *testing.T) {
 	t.Run("a root which revoked itself is refused at the top of a chain", func(t *testing.T) {
 		rootList := writeCRLDER(t, "root.crl", crlSignedBy(t, pki.rootCert, pki.rootKey, pki.rootCert.SerialNumber))
 		v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path, rootList}})
-		if err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsToRoot(client)); err == nil {
-			t.Error("a root which revoked itself was accepted at the top of a chain")
-		}
+		requireRefused(t, v, rawDER(t, client), pki.chainsToRoot(client), "a root which revoked itself was accepted at the top of a chain")
 	})
 
 	t.Run("a complete chain with a current list for every issuer is served", func(t *testing.T) {
 		cleanRoot := writeCRLDER(t, "root.crl", crlSignedBy(t, pki.rootCert, pki.rootKey))
 		v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path, cleanRoot}})
-		if err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsToRoot(client)); err != nil {
-			t.Errorf("expected admission, got: %v", err)
-		}
+		requireAdmitted(t, v, rawDER(t, client), pki.chainsToRoot(client), "a complete chain with a current list for every issuer should verify")
 	})
 
 	t.Run("a chain reaching a root with no list from it is refused by name", func(t *testing.T) {
-		// The issuing CA is only as good as the root's word about it. With a chain which reaches the
-		// root and no list from the root, that word is missing — so this refuses and says whose
-		// coverage is absent rather than trusting the CA on its own say-so.
+		// a chain reaching the root with no list from it is uncovered, and says whose
 		v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
-		err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsToRoot(client))
-		if err == nil {
-			t.Fatal("the issuing CA was accepted with nothing saying whether its own key is still good")
-		}
+		err := requireRefused(t, v, rawDER(t, client), pki.chainsToRoot(client), "the issuing CA was accepted with nothing saying whether its own key is still good")
 		if !strings.Contains(err.Error(), pki.rootCert.Subject.CommonName) {
 			t.Errorf("the refusal should name the missing coverage by its issuer, got: %v", err)
 		}
@@ -713,10 +616,7 @@ func TestCRLVerifierReportsARevocationOncePerConnection(t *testing.T) {
 		wantReports int
 	}{
 		{
-			// Two chains and the same CA revoked on both of them — which is what revoking a
-			// cross-signed certificate means in practice. The leaf itself is clean on both paths, so
-			// the refusal comes from a revocation rather than from missing coverage, and it is
-			// reported once for the connection instead of once per chain tried.
+			// the same CA revoked on both paths, reported once for the connection
 			name: "every path revoked it",
 			sources: []string{
 				crlA,
@@ -728,9 +628,6 @@ func TestCRLVerifierReportsARevocationOncePerConnection(t *testing.T) {
 			wantReports: 1,
 		},
 		{
-			// One path revoked, the other clean: refused on the strength of the one path, and
-			// reported once — not once per chain which objected, and not silently because a
-			// different path had nothing to say about it.
 			name:        "another path is clean",
 			sources:     []string{crlA, crlB, issuingB},
 			wantErr:     true,
@@ -740,8 +637,7 @@ func TestCRLVerifierReportsARevocationOncePerConnection(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: tc.sources})
 
-			core, logs := observer.New(zapcore.ErrorLevel)
-			v.logger = zap.New(core)
+			logs := observeLogs(t, v, zapcore.ErrorLevel)
 
 			err := v.VerifyClientCertificate(raw, chains)
 			if tc.wantErr && err == nil {
@@ -754,8 +650,7 @@ func TestCRLVerifierReportsARevocationOncePerConnection(t *testing.T) {
 			if got := logs.FilterMessage("rejecting a revoked client certificate").Len(); got != tc.wantReports {
 				t.Errorf("%d error lines about a revocation, want %d", got, tc.wantReports)
 			}
-			// What is reported is the certificate a CRL actually named, which here is the issuing CA
-			// on one of its two certificates — not the leaf, which is clean on both paths.
+			// the report names the revoked issuing CA, not the clean leaf
 			wantSerials := map[string]bool{
 				interA.SerialNumber.String(): true,
 				interB.SerialNumber.String(): true,
@@ -773,12 +668,9 @@ func TestCRLVerifierReportsARevocationOncePerConnection(t *testing.T) {
 	}
 }
 
-// TestCRLVerifierDirectlyTrustedCertificateWhichIsNotSelfSigned covers a certificate which is in
-// the trust pool and presented as an identity, but is not self-signed — a CA certificate placed
-// there so that chains complete, for instance. Go builds a chain of one for it, so nothing above it
-// could have revoked it, and a status which cannot be established is a refusal: issuerOf answers
-// only for a top which carries its own name as issuer. The advice in the refusal has to fit the
-// certificate at hand, which is why it says nothing about being self-signed.
+// TestCRLVerifierDirectlyTrustedCertificateWhichIsNotSelfSigned checks a
+// certificate in the trust pool presented as an identity: nothing above it can
+// cover it, and the refusal must not call it self-signed.
 func TestCRLVerifierDirectlyTrustedCertificateWhichIsNotSelfSigned(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	path := writeCRLDER(t, "issuing.crl", pki.crl(t, crlOptions{number: 1}))
@@ -801,10 +693,8 @@ func TestCRLVerifierDirectlyTrustedCertificateWhichIsNotSelfSigned(t *testing.T)
 }
 
 func TestCRLVerifierNotYetValidListDoesNotHideAnOlderOne(t *testing.T) {
-	// A publisher whose clock runs a few minutes ahead writes a list which is not valid yet. The
-	// list before it, still inside its own lifetime, says everything the new one will; answering
-	// "not valid until" while it sits in the same file would take every client down for the length
-	// of the overlap.
+	// a not-yet-valid list from a publisher with a fast clock must not hide the
+	// current one in the same file
 	pki := newCRLTestPKI(t)
 	client, _ := pki.leaf(t, 7840)
 	good, _ := pki.leaf(t, 7841)
@@ -815,44 +705,32 @@ func TestCRLVerifierNotYetValidListDoesNotHideAnOlderOne(t *testing.T) {
 		nextUpdate: time.Now().Add(72 * time.Hour),
 	})
 	current := pki.crl(t, crlOptions{number: 1, revoked: []x509.RevocationListEntry{revokedEntry(7840)}})
-	path := writeCRLPEM(t, "issuing.crl", notYet, current)
+	path := writeLists(t, "issuing.crl", notYet, current)
 
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
 
-	err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client))
-	if err == nil {
-		t.Fatal("a serial its CA has revoked was served")
-	}
+	err := pki.requireRefused(t, v, client, "a serial its CA has revoked was served")
 	if !strings.Contains(err.Error(), "revoked") {
 		t.Errorf("the older in-date list should be the one which answers, got: %v", err)
 	}
-	if err := v.VerifyClientCertificate(rawDER(t, good), pki.chainsFor(good)); err != nil {
-		t.Errorf("a serial the older list does not revoke should be served, got: %v", err)
-	}
+	pki.requireAdmitted(t, v, good, "a serial the older list does not revoke should be served")
 }
 
-// TestCRLVerifierAnUnusableCRLSaysWhyOutLoud covers the refusals which look like coverage from the
-// outside: a list is loaded for this issuer, but it cannot be relied on — it passed its nextUpdate,
-// or has not begun, or does not carry the verified chain's signature, or every list for that issuer
-// had to be set aside. A refusal only travels back to Go, which ends the handshake and says nothing
-// further, so an operator is left with clients turning away and a log with nothing in it. Each of
-// these is said once loudly and then quietly for as long as it stays true.
+// TestCRLVerifierAnUnusableCRLSaysWhyOutLoud checks that a loaded but unusable
+// list is logged once at warning and then at debug.
 func TestCRLVerifierAnUnusableCRLSaysWhyOutLoud(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	client, _ := pki.leaf(t, 7843)
 
-	// A list which names a key the certificate in hand does not hold — one CA certificate retired,
-	// another issued under the same subject. It is minted from a copy of the issuing CA carrying a
-	// different subject key id, which is what Go publishes as the list's authority key id, so the
-	// list holds exactly one such extension: an injected extra would leave two and test which one
-	// Go's parser keeps.
+	// a copy of the issuing CA with another subject key id, so the list's
+	// authority key id names a key the chain does not hold
 	retiredKey := *pki.issCert
 	retiredKey.SubjectKeyId = []byte{0x01, 0x02, 0x03}
 
 	for _, tc := range []struct {
 		name   string
 		list   []byte
-		want   string // in the refusal handed back to Go
+		want   string // in the refusal
 		reason string // in the log line
 	}{
 		{
@@ -891,13 +769,9 @@ func TestCRLVerifierAnUnusableCRLSaysWhyOutLoud(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{writeCRLDER(t, "issuing.crl", tc.list)}})
 
-			core, logs := observer.New(zapcore.DebugLevel)
-			v.logger = zap.New(core)
+			logs := observeLogs(t, v, zapcore.DebugLevel)
 
-			err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client))
-			if err == nil {
-				t.Fatal("a certificate under an unusable CRL was served")
-			}
+			err := pki.requireRefused(t, v, client, "a certificate under an unusable CRL was served")
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("expected the refusal to say %q, got: %v", tc.want, err)
 			}
@@ -913,12 +787,8 @@ func TestCRLVerifierAnUnusableCRLSaysWhyOutLoud(t *testing.T) {
 				}
 			}
 
-			// The next client under the same CA is refused for the same reason, and that is the same
-			// news: it must not become a wall of warnings, but it should stay visible to whoever is
-			// looking with debug on.
-			if err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client)); err == nil {
-				t.Fatal("a certificate under an unusable CRL was served")
-			}
+			// the same condition again is not a new warning, but stays visible at debug
+			pki.requireRefused(t, v, client, "a certificate under an unusable CRL was served")
 			if got := logs.FilterMessage(message).FilterLevelExact(zapcore.WarnLevel).Len(); got != 1 {
 				t.Errorf("an unchanged condition was announced loudly again: %d lines", got)
 			}
@@ -929,10 +799,8 @@ func TestCRLVerifierAnUnusableCRLSaysWhyOutLoud(t *testing.T) {
 	}
 }
 
-// TestCRLVerifierExpiryIsStrict pins that a list is trusted only inside the lifetime its issuer
-// published, with nothing to switch that off. Past nextUpdate the CA has said nothing about this
-// certificate, and that is a refusal in its own words rather than a fall through to "no CRL covers
-// it" — the same call OpenSSL makes with "CRL has expired".
+// TestCRLVerifierExpiryIsStrict checks that a list past its nextUpdate is
+// refused in its own words, as OpenSSL does with "CRL has expired".
 func TestCRLVerifierExpiryIsStrict(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	client, _ := pki.leaf(t, 7860)
@@ -943,25 +811,19 @@ func TestCRLVerifierExpiryIsStrict(t *testing.T) {
 		nextUpdate: time.Now().Add(-time.Hour),
 	})
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{writeCRLDER(t, "lapsed.crl", lapsed)}})
-	err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client))
-	if err == nil {
-		t.Fatal("a certificate was served on the word of a CA which stopped speaking an hour ago")
-	}
+	err := pki.requireRefused(t, v, client, "a certificate was served on the word of a CA which stopped speaking an hour ago")
 	if !strings.Contains(err.Error(), "nextUpdate") {
 		t.Errorf("the refusal should say the list passed its nextUpdate, got: %v", err)
 	}
 
-	// A lapse measured in seconds is still a lapse; only drift between this clock and the issuer's
-	// is tolerated, and only within crlClockSkew.
+	// only drift within crlClockSkew is tolerated
 	nearMiss := pki.crl(t, crlOptions{
 		number:     2,
 		thisUpdate: time.Now().Add(-time.Hour),
 		nextUpdate: time.Now().Add(-time.Minute),
 	})
 	v = provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{writeCRLDER(t, "near-miss.crl", nearMiss)}})
-	if err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client)); err != nil {
-		t.Errorf("a list a minute past its nextUpdate is inside the tolerated clock drift, got: %v", err)
-	}
+	pki.requireAdmitted(t, v, client, "a list a minute past its nextUpdate is inside the tolerated clock drift")
 
 	beyondSkew := pki.crl(t, crlOptions{
 		number:     3,
@@ -969,24 +831,16 @@ func TestCRLVerifierExpiryIsStrict(t *testing.T) {
 		nextUpdate: time.Now().Add(-(crlClockSkew + time.Minute)),
 	})
 	v = provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{writeCRLDER(t, "beyond-skew.crl", beyondSkew)}})
-	if err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client)); err == nil {
-		t.Error("a list past the tolerated clock drift was still believed")
-	}
+	pki.requireRefused(t, v, client, "a list past the tolerated clock drift was still believed")
 
-	// A list with no nextUpdate makes no promise to expire by, and RFC 5280 lets a client treat it as
-	// current indefinitely. The reload schedule is what notices such a publisher has stopped; the
-	// list itself stays usable, since refusing on it would be inventing an expiry its issuer declined
-	// to publish.
+	// RFC 5280 lets a list with no nextUpdate stay current indefinitely
 	timeless := pki.crl(t, crlOptions{number: 4, noNextUpdate: true})
 	v = provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{writeCRLDER(t, "timeless.crl", timeless)}})
-	if err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client)); err != nil {
-		t.Errorf("a list without nextUpdate should remain current, got: %v", err)
-	}
+	pki.requireAdmitted(t, v, client, "a list without nextUpdate should remain current")
 }
 
 func TestIssuerOf(t *testing.T) {
-	// The names have to differ from one another: two certificates with empty names have equal
-	// RawSubject and RawIssuer, which would make each of them look self-issued.
+	// the names must differ, or every certificate looks self-issued
 	leaf := &x509.Certificate{RawSubject: []byte("client"), RawIssuer: []byte("issuing")}
 	intermediate := &x509.Certificate{RawSubject: []byte("issuing"), RawIssuer: []byte("root")}
 	root := &x509.Certificate{RawSubject: []byte("root"), RawIssuer: []byte("root")}
@@ -998,30 +852,19 @@ func TestIssuerOf(t *testing.T) {
 	if got := issuerOf(chain, 1); got != root {
 		t.Error("the issuer of the intermediate is not the next certificate in the chain")
 	}
-	// A self-issued last certificate is its own issuer. What reaches here is a CA which re-keyed in
-	// place and is in the trust pool: the same name on both sides with a different key behind it,
-	// so its status really is somebody's to state and this is the only copy of it available to
-	// verify such a list against. The same answer covers an ordinary self-signed root at the top of
-	// a real chain — which is why a deployment trusting a root alone has to load that root's CRL —
-	// and a peer certificate presented as the whole chain which carries its own name as issuer.
+	// a self-issued last certificate is its own issuer: a self-signed root, or a
+	// re-keyed CA in the trust pool
 	if got := issuerOf(chain, 2); got != root {
 		t.Error("a self-issued last certificate should be its own issuer")
 	}
 
-	// A chain which ends at an intermediate which is trusted directly without being self-issued —
-	// a trust_pool holding the issuing CA — holds no copy of that CA's issuer, so there is nothing
-	// to verify its CRL against and its revocation status cannot be established from this chain.
-	// A peer certificate presented alone looks exactly like this, since a client certificate is not
-	// self-issued; verifyChain refuses both rather than passing them.
 	if got := issuerOf([]*x509.Certificate{leaf, intermediate}, 1); got != nil {
 		t.Error("a last certificate which is not self-issued should have no issuer in the chain")
 	}
 }
 
-// TestCRLVerifierIssuerOfNamesWhoSpeaksForWhom pins which certificate may answer for which: the
-// one above it in the verified chain. At the top of a chain there is no one above it, so either the
-// certificate vouches for itself — and then its own list is the only possible answer — or nothing
-// can be established about it at all.
+// TestCRLVerifierIssuerOfNamesWhoSpeaksForWhom checks which certificate
+// answers for which.
 func TestCRLVerifierIssuerOfNamesWhoSpeaksForWhom(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	leaf, _ := pki.leaf(t, 7850)
@@ -1034,16 +877,12 @@ func TestCRLVerifierIssuerOfNamesWhoSpeaksForWhom(t *testing.T) {
 		t.Errorf("a chain ends where its last certificate's issuer is not in it, got %v", got)
 	}
 
-	// A self-signed root at the top is its own issuer: asking it about itself is meaningful, and a
-	// deployment which trusts a root alone therefore needs that root to publish.
 	full := pki.chainsToRoot(leaf)[0]
 	if got := issuerOf(full, 2); got != pki.rootCert {
 		t.Error("a self-signed certificate at the top of a chain should answer for itself")
 	}
 
-	// Self-issued is not self-signed: a CA which renews itself in place keeps its name and changes
-	// its key, so its own word does not stand in for an issuer's and it is not treated as an anchor
-	// whose status nobody can question.
+	// self-issued is not self-signed: a CA re-keyed in place keeps its name
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generating a key: %v", err)
@@ -1065,22 +904,14 @@ func TestCRLVerifierIssuerOfNamesWhoSpeaksForWhom(t *testing.T) {
 	if err := reKeyed.CheckSignatureFrom(reKeyed); err == nil {
 		t.Fatal("the test certificate signs itself, so it is not the case under test")
 	}
-	// The name is what issuerOf goes by, and this certificate's subject is its own: it answers for
-	// itself, exactly as a self-signed root would. What keeps the root's own list from being taken as
-	// this certificate's word is the signature check — a list signed by the old key does not verify
-	// against the new one, which TestCRLVerifierAuthorityKeyIDMustMatchTheIssuer and
-	// TestCRLVerifierNumberRegressionIsScopedToItsOwnSigningKey cover from each side.
+	// issuerOf goes by name; the signature check keeps the old key's list out
 	if got := issuerOf([]*x509.Certificate{leaf, reKeyed}, 1); got != reKeyed {
 		t.Errorf("a self-issued certificate at the top of a chain should answer for its own name, got %v", got)
 	}
 }
 
-// BenchmarkVerifyClientCertificate measures what checking one client certificate costs as the list
-// grows: a signature verification per certificate in scope, plus a lookup in an index which holds
-// everything the CA has revoked. The entry count is the axis worth watching, since it is the number
-// here a CA controls; TestCRLVerifierLargeListCost measures the memory side of the same list. What
-// the growing count costs is left to the numbers rather than explained here — reading where the time
-// goes needs a profile, and this is the place which will show a regression in it.
+// BenchmarkVerifyClientCertificate measures one check as the list grows. The
+// signature verdict is remembered after the first check, so this is steady state.
 func BenchmarkVerifyClientCertificate(b *testing.B) {
 	pki := newCRLTestPKI(b)
 	client, _ := pki.leaf(b, 7860)

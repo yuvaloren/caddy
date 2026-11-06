@@ -31,18 +31,14 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
-// provisionCRLVerifier provisions a verifier the way Caddy would and cleans it up when the test
-// ends. The module reads the wall clock directly, as it does in production: what a test wants to
-// move is time itself, so lists are minted around time.Now() rather than against a clock the test
-// winds. Reloading is a test's own call — reload on the returned verifier — which is what a
-// distribution point which has stopped publishing looks like from the server's side.
+// provisionCRLVerifier provisions a verifier the way Caddy would and cleans it up
+// when the test ends. Lists are minted around time.Now(); tests reload by hand.
 func provisionCRLVerifier(t testing.TB, cfg *CRLVerifier) *CRLVerifier {
 	t.Helper()
 
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
 	t.Cleanup(func() {
-		// Caddy cancels the context before cleanup runs, which is what lets the reload loop
-		// finish; both happen here in that order.
+		// cancel before Cleanup, as Caddy does
 		cancel()
 		if err := cfg.Cleanup(); err != nil {
 			t.Errorf("cleaning up: %v", err)
@@ -59,16 +55,14 @@ func provisionCRLVerifier(t testing.TB, cfg *CRLVerifier) *CRLVerifier {
 	return cfg
 }
 
-// provisionCRLVerifierExpectError provisions a verifier which is expected to fail, so that the
-// reason can be asserted on.
+// provisionCRLVerifierExpectError provisions a verifier which is expected to fail.
 func provisionCRLVerifierExpectError(t testing.TB, cfg *CRLVerifier) error {
 	t.Helper()
 
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
 	err := cfg.Provision(ctx)
 	if err == nil {
-		// A verifier which came up far enough to start its reload loop has to be stopped, in the
-		// order Caddy uses: cancel first, since that is what ends the loop, then wait for it.
+		// cancel first, as Caddy does, so the reload loop ends
 		cancel()
 		if cleanupErr := cfg.Cleanup(); cleanupErr != nil {
 			t.Errorf("cleaning up a config which provisioned anyway: %v", cleanupErr)
@@ -79,10 +73,6 @@ func provisionCRLVerifierExpectError(t testing.TB, cfg *CRLVerifier) error {
 	return err
 }
 
-// TestCRLVerifierCaddyfile covers the module's whole configuration language: files inline or with
-// crl_file, urls with crl_url, and a fetch timeout. Anything else is refused by name rather than
-// ignored, so a directive left over from an older draft fails at load instead of silently doing
-// nothing.
 func TestCRLVerifierCaddyfile(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -125,7 +115,7 @@ func TestCRLVerifierCaddyfile(t *testing.T) {
 			},
 		},
 		{
-			// Inline paths are a shorthand for crl_file, so the two forms may be mixed.
+			// inline paths are shorthand for crl_file
 			name:  "inline files and subdirectives combine",
 			input: "crl /etc/caddy/a.crl {\n\tcrl_file /x.crl\n}",
 			want: func(v *CRLVerifier) error {
@@ -159,10 +149,6 @@ func TestCRLVerifierCaddyfile(t *testing.T) {
 	}
 }
 
-// TestCRLVerifierDefaults pins the fetch timeout when it is not set and when it is, and that a value
-// out of range is refused at config load rather than silently replaced. The other two knobs take no
-// default worth pinning: an empty list of files or URLs is simply nothing to load, which
-// TestCRLVerifierUnusableSource covers under "no sources at all".
 func TestCRLVerifierDefaults(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	path := writeCRLDER(t, "issuing.crl", pki.crl(t, crlOptions{number: 1}))
@@ -183,16 +169,11 @@ func TestCRLVerifierDefaults(t *testing.T) {
 	}
 }
 
-// TestCRLVerifierLargeListCost measures what a very large CRL costs to hold and to load, which is the
-// reason the module refuses a body longer than defaultCRLMaxSize instead of reading it. It mints a list
-// with as many revoked serials as CRL_COST_MEASURE asks for and holds it in memory, so it is skipped
-// unless that variable names a count. Run it with:
+// TestCRLVerifierLargeListCost measures what a very large CRL costs to hold and
+// load, the reason for defaultCRLMaxSize. It is skipped unless CRL_COST_MEASURE
+// names a count of revoked serials:
 //
 //	CRL_COST_MEASURE=1000000 go test -run TestCRLVerifierLargeListCost ./modules/caddytls/ -v
-//
-// Serials are sixteen bytes, as a real CA issues them. The index costs the same per entry whatever a
-// serial holds, but the DER body grows with them, and a parsed list keeps that body: checking a
-// signature means having what was signed.
 func TestCRLVerifierLargeListCost(t *testing.T) {
 	const env = "CRL_COST_MEASURE"
 	raw := os.Getenv(env)
@@ -226,8 +207,7 @@ func TestCRLVerifierLargeListCost(t *testing.T) {
 		t.Fatalf("statting the list: %v", err)
 	}
 
-	// Minting is an allocation of its own, and this measures what holding the list costs rather than
-	// what publishing one does, so drop it and collect before reading.
+	// drop the minted entries so only the loaded list is measured
 	revoked = nil
 	before := heapAllocated()
 

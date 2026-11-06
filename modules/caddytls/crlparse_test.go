@@ -21,33 +21,30 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
-	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestCRLVerifierBundledPEMObjects(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	client, _ := pki.leaf(t, 1500)
 
-	// A bundle whose revoked list comes second: reading such a file with `openssl crl` shows only
-	// the first object, so this is where a loader which stops at one object loses a revocation.
+	// the revoked list comes last; a loader which stops at one object misses it
 	rootCRL := pki.crl(t, crlOptions{issuer: pki.rootCert, signer: pki.rootKey, number: 1})
 	first := pki.crl(t, crlOptions{number: 1})
 	second := pki.crl(t, crlOptions{number: 2, revoked: []x509.RevocationListEntry{revokedEntry(1500)}})
-	path := writeCRLPEM(t, "bundle.pem", rootCRL, first, second)
+	path := writeLists(t, "bundle.pem", rootCRL, first, second)
 
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
 
-	// Named as revoked, not merely refused: a loader which read nothing at all would refuse this
-	// certificate too, and the test would pass while proving nothing about the bundle.
+	// revoked, not merely refused: a loader which read nothing would refuse too
 	err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client))
 	if err == nil {
 		t.Fatal("the revocation in the third object of the bundle was missed")
@@ -56,29 +53,19 @@ func TestCRLVerifierBundledPEMObjects(t *testing.T) {
 		t.Errorf("expected the third object to be the one which refused, got: %v", err)
 	}
 
-	// And the objects before it were read as well as not skipped. The chain is taken all the way to
-	// the root, so admitting this certificate needs the first object of the bundle — the root's own
-	// list, which is what speaks for a self-issued top — alongside one of the issuing CA's. A loader
-	// which kept only the last PEM object could not serve it.
+	// a chain to the root needs the bundle's first object, the root's own list
 	good, _ := pki.leaf(t, 1501)
 	if err := v.VerifyClientCertificate(rawDER(t, good), pki.chainsToRoot(good)); err != nil {
 		t.Errorf("a certificate the bundle does not revoke was refused: %v", err)
 	}
 }
 
-// TestCRLVerifierAByteOrderMarkOrPreambleDoesNotHideTheFirstObject covers the two ways a CRL file can
-// begin with something which is not a PEM header. A byte-order mark is not content and a line of prose
-// ends in a newline, so by the time anything is counted or decoded the first header begins a line in
-// both cases and every object has to load. Without the trim a byte-order mark would put that header off
-// the line start pem.Decode looks for: the two counts disagree and the source is refused — loudly, so
-// nothing is served which should not be, but for how the file was saved rather than for what is in it,
-// and naming a header which looks perfectly fine in the operator's editor. A preamble needs no trim; it
-// is here because it is the other way a CRL file starts with text.
+// A byte-order mark or a line of prose before the first PEM header must
+// not hide that object from pem.Decode.
 func TestCRLVerifierAByteOrderMarkOrPreambleDoesNotHideTheFirstObject(t *testing.T) {
 	pki := newCRLTestPKI(t)
 
-	// The root's own list first: it is the object a chain taken all the way up needs, so it is also
-	// the one whose loss these assertions would notice.
+	// the root's list first: a chain to the root needs it
 	rootCRL := pki.crl(t, crlOptions{issuer: pki.rootCert, signer: pki.rootKey, number: 1})
 	issuing := pki.crl(t, crlOptions{number: 1})
 	bundle := writeCRLPEMBytes(rootCRL, issuing)
@@ -97,9 +84,7 @@ func TestCRLVerifierAByteOrderMarkOrPreambleDoesNotHideTheFirstObject(t *testing
 			if got := len(v.current().byIssuer); got != 2 {
 				t.Errorf("the bundle covers %d issuers, want 2 — an object after the %s was skipped", got, tc.name)
 			}
-			// Not just counted: the root's list has to be the one answering. A chain to the root is
-			// refused for a missing top-level list, so admitting this client proves both objects are
-			// in service rather than that one of them was parsed and dropped.
+			// a chain to the root proves both objects are in service, not just counted
 			good, _ := pki.leaf(t, 1600)
 			if err := v.VerifyClientCertificate(rawDER(t, good), pki.chainsToRoot(good)); err != nil {
 				t.Errorf("a certificate the bundle does not revoke was refused: %v", err)
@@ -108,14 +93,9 @@ func TestCRLVerifierAByteOrderMarkOrPreambleDoesNotHideTheFirstObject(t *testing
 	}
 }
 
-// TestCRLVerifierAHeaderWhichDoesNotBeginALineFailsTheSource is the damage which a PEM object count
-// compared only with line-initial headers cannot see. pem.Decode looks for the marker at the start of a
-// line and nowhere else, so a header with anything before it on its own line names an object no reader
-// will return. In a bundle that hides every list before the first readable one while the source loads
-// without complaint — this is what a tool which appended without a newline leaves behind. A single
-// object takes the same path by way of the DER branch, which reads the body as one list before any PEM
-// damage is claimed, and needs its own assertion: "malformed DER" about an indented PEM object would
-// send an operator off to regenerate a file whose only fault is spacing.
+// pem.Decode only finds a header at the start of a line, so a header with
+// anything before it names an object no reader returns. The source must
+// fail rather than load what came after it.
 func TestCRLVerifierAHeaderWhichDoesNotBeginALineFailsTheSource(t *testing.T) {
 	pki := newCRLTestPKI(t)
 
@@ -150,10 +130,7 @@ func TestCRLVerifierAHeaderWhichDoesNotBeginALineFailsTheSource(t *testing.T) {
 			})
 		}
 
-		// Damage which arrives in the middle of a file rather than at its start. A byte-order mark is
-		// only trimmed from the front, because that is where one is written; a second one mid-file is
-		// two files concatenated and puts the next header off its line. Prose quoting the marker
-		// mid-line is the same shape, and it is what a bug report pasted above a bundle looks like.
+		// damage mid-file: a byte-order mark is only trimmed from the front
 		for _, tc := range []struct {
 			name   string
 			before []byte
@@ -176,8 +153,7 @@ func TestCRLVerifierAHeaderWhichDoesNotBeginALineFailsTheSource(t *testing.T) {
 			})
 		}
 
-		// The same bytes with nothing before the first header load, so the refusals above are about
-		// where the header sits and not about what the file holds.
+		// the same bytes with nothing before the first header load
 		v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{writeFile(t, "clean-"+body.name+".pem", body.pem)}})
 		if got := len(v.current().byIssuer); got != body.want {
 			t.Errorf("the clean %s covers %d issuers, want %d", body.name, got, body.want)
@@ -210,8 +186,7 @@ func TestCRLVerifierCriticalExtensions(t *testing.T) {
 	})
 
 	t.Run("delta crl indicator", func(t *testing.T) {
-		// A delta CRL holds only what changed since the base list, so treating it as the whole
-		// word of its issuer would clear every older revocation.
+		// a delta holds only changes; loading it as a base list forgets the rest
 		number, err := asn1.Marshal(big.NewInt(2))
 		if err != nil {
 			t.Fatalf("marshaling the number: %v", err)
@@ -227,12 +202,7 @@ func TestCRLVerifierCriticalExtensions(t *testing.T) {
 	})
 
 	t.Run("issuing distribution point", func(t *testing.T) {
-		// A list which names a distribution point may speak for part of its CA only, and nothing in
-		// the module can tell that from an address. Loading it would clear every revocation it left
-		// out, so every form is refused: one which points at a URI, one which declares nothing at all
-		// beyond having a distribution point, and either of those without the critical bit. Marking
-		// the extension non-critical does not make the scope optional; it says that an implementation
-		// which understands it may ignore it, which is not a claim this module can afford to act on.
+		// a scoped list may cover only part of its CA; refused critical or not
 		for _, tc := range []struct {
 			name string
 			ext  pkix.Extension
@@ -306,10 +276,7 @@ func TestCRLVerifierRevokedEntryDetails(t *testing.T) {
 	}
 
 	t.Run("an entry for another issuer refuses the list", func(t *testing.T) {
-		// An indirect CRL entry names a CA other than the one which signed the list. Deciding which
-		// of two issuers a serial belongs to is not something this module will guess at, so the
-		// whole list is refused: dropping the entry instead would make an easy-to-forge extension a
-		// way to forget a revocation.
+		// an indirect entry names another CA; refuse the list, not just the entry
 		_, otherRoot := mintCA(t, "Another Root CA", caPair{}, nil)
 		entry := revokedEntry(11001)
 		entry.Extensions = []pkix.Extension{{Id: oidCertificateIssuer, Value: mustDirectoryName(t, otherRoot.RawSubject)}}
@@ -328,12 +295,10 @@ func TestCRLVerifierDeltaCRLIndicatorIsRefused(t *testing.T) {
 		ext      pkix.Extension
 		wantLoad bool
 	}{
-		// RFC 5280 says a delta marks its indicator critical, but the cost of believing one is that
-		// every revocation it does not repeat is forgotten, so the indicator alone refuses.
+		// RFC 5280 marks the indicator critical, but the indicator alone refuses
 		{name: "critical", ext: pkix.Extension{Id: oidDeltaCRLIndicator, Critical: true, Value: []byte{0x02, 0x01, 0x05}}},
 		{name: "not marked critical", ext: pkix.Extension{Id: oidDeltaCRLIndicator, Value: []byte{0x02, 0x01, 0x05}}},
-		// On a base CRL the freshest-CRL extension only says where deltas would be published; that
-		// is harmless to ignore unless it is asserted as something this module must honour.
+		// freshest CRL only says where deltas are published; harmless unless critical
 		{name: "freshest crl pointer", ext: pkix.Extension{Id: oidFreshestCRL, Value: []byte{0x30, 0x00}}, wantLoad: true},
 		{name: "freshest crl marked critical", ext: pkix.Extension{Id: oidFreshestCRL, Critical: true, Value: []byte{0x30, 0x00}}},
 	} {
@@ -359,16 +324,13 @@ func TestCRLVerifierDeltaCRLIndicatorIsRefused(t *testing.T) {
 	}
 }
 
-// TestCRLVerifierATruncatedObjectFailsTheSource is about the shape of a download which stopped
-// early. pem.Decode walks over an object it cannot finish and leaves the rest of the file where it
-// stands, so loading what came before it would serve a bundle missing its tail as though that were
-// the whole file — covering fewer issuers than the file names, with every certificate under the
-// missing ones refused as uncovered and nothing in a log to say why.
+// pem.Decode skips an object it cannot finish, so a bundle cut short must
+// fail rather than quietly cover fewer issuers than the file names.
 func TestCRLVerifierATruncatedObjectFailsTheSource(t *testing.T) {
 	pki := newCRLTestPKI(t)
 
-	good := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: pki.crl(t, crlOptions{number: 1})})
-	root := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: pki.crl(t, crlOptions{
+	good := pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: pki.crl(t, crlOptions{number: 1})})
+	root := pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: pki.crl(t, crlOptions{
 		issuer: pki.rootCert, signer: pki.rootKey, number: 1,
 	})})
 	cutShort := append([]byte(nil), root[:len(root)/2]...)
@@ -381,24 +343,20 @@ func TestCRLVerifierATruncatedObjectFailsTheSource(t *testing.T) {
 		t.Errorf("expected the failure to say an object is damaged or cut short, got: %v", err)
 	}
 
-	// The same file with the tail present loads both lists, so the check is about damage and not
-	// about a bundle of two.
+	// the whole file loads both lists
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{writeFile(t, "whole.crl", append(good, root...))}})
 	if got := len(v.current().byIssuer); got != 2 {
 		t.Errorf("a whole bundle of two lists loaded %d issuers, want 2", got)
 	}
 }
 
-// TestCRLVerifierADamagedObjectInTheMiddleFailsTheSource is the twin of a bundle cut short: an object
-// between two readable ones, damaged so that PEM's decoder gives up on it and hands back the next one
-// without saying anything. Loading what remains would cover fewer issuers than this file names, and
-// the clients under the list which was walked past would be refused as uncovered — with advice to
-// configure a CRL which is sitting in the file.
+// pem.Decode walks past a damaged object to the next readable one without
+// saying so, so the source must fail rather than load what remains.
 func TestCRLVerifierADamagedObjectInTheMiddleFailsTheSource(t *testing.T) {
 	pki := newCRLTestPKI(t)
 
-	issuing := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: pki.crl(t, crlOptions{number: 1})})
-	root := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: pki.crl(t, crlOptions{
+	issuing := pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: pki.crl(t, crlOptions{number: 1})})
+	root := pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: pki.crl(t, crlOptions{
 		issuer: pki.rootCert, signer: pki.rootKey, number: 1,
 	})})
 	damaged := []byte("-----BEGIN X509 CRL-----\nnot base64 at all, and no DER behind it\n-----END X509 CRL-----\n")
@@ -408,14 +366,12 @@ func TestCRLVerifierADamagedObjectInTheMiddleFailsTheSource(t *testing.T) {
 	if err == nil {
 		t.Fatal("a bundle with a damaged object between two good ones loaded as if it were whole")
 	}
-	// The module's own words for an object between two readable ones, not the similar line about a
-	// bundle which ends badly.
+	// the message for an object between two readable ones, not for a bundle cut short
 	if !strings.Contains(err.Error(), "a PEM object in this source is damaged") {
 		t.Errorf("expected the failure to name a damaged object, got: %v", err)
 	}
 
-	// The same bundle with that object taken out loads both lists, so this is about the damage and
-	// not about a bundle of two.
+	// without the damaged object both lists load
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{writeFile(t, "whole.crl",
 		append(append([]byte(nil), issuing...), root...))}})
 	if got := len(v.current().byIssuer); got != 2 {
@@ -423,10 +379,9 @@ func TestCRLVerifierADamagedObjectInTheMiddleFailsTheSource(t *testing.T) {
 	}
 }
 
-// TestCRLVerifierDataAfterADERListFailsTheSource is the DER twin of the same rule: Go reads the first
-// CertificateList and pays no attention to what follows it, so a file of concatenated DER would
-// otherwise cover one issuer of several without a word. It also pins how that source is described: it
-// does hold a CRL, so the message says how it was read rather than claiming there is nothing in it.
+// x509.ParseRevocationList reads the first CertificateList and ignores
+// what follows, so concatenated DER must fail rather than cover one
+// issuer of several.
 func TestCRLVerifierDataAfterADERListFailsTheSource(t *testing.T) {
 	pki := newCRLTestPKI(t)
 
@@ -438,26 +393,20 @@ func TestCRLVerifierDataAfterADERListFailsTheSource(t *testing.T) {
 	if err == nil {
 		t.Fatal("a file of two concatenated DER lists loaded as if it held one")
 	}
-	// Not Go's words — Go has none for this, which is why the module checks. Its own phrase names
-	// what it found and how it was read: a source refused this way does hold a CRL, so the message
-	// says how it was read rather than claiming there is nothing in it to find.
-	if !strings.Contains(err.Error(), "reading this source as a single DER CRL: trailing data after the CRL in this source") {
-		t.Errorf("expected the failure to name how the source was read and what followed, got: %v", err)
+	// the source does hold a CRL, so the message must not claim it is empty
+	if !errors.Is(err, errTrailingData) {
+		t.Errorf("expected the refusal to be about trailing data, got: %v", err)
 	}
 
-	// The first list on its own loads, so the refusal is about what follows it and not about DER.
+	// the first list on its own loads
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{writeCRLDER(t, "one.der", first)}})
 	if got := len(v.current().byIssuer); got != 1 {
 		t.Errorf("a single DER list loaded %d issuers, want 1", got)
 	}
 }
 
-// TestCRLVerifierARefusedListDoesNotCostTheRestOfItsBundle is about how much of a source is lost
-// with a list this module will not read. Several lists from several CAs are usually shipped in one
-// file, and a delta or a distribution-point list says something about its own CA and nothing about
-// the others beside it: refusing it has to lose that one coverage, not the whole bundle, or an
-// operator who exports Issuing and Root together finds every client refused because of a list they
-// never asked to be believed.
+// A delta or distribution-point list says nothing about the other CAs in
+// its bundle, so refusing it loses that one coverage, not the whole file.
 func TestCRLVerifierARefusedListDoesNotCostTheRestOfItsBundle(t *testing.T) {
 	pki := newCRLTestPKI(t)
 	client, _ := pki.leaf(t, 7860)
@@ -482,18 +431,13 @@ func TestCRLVerifierARefusedListDoesNotCostTheRestOfItsBundle(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			good := pki.crl(t, crlOptions{number: 2})
-			bundle := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: good})
-			bundle = append(bundle, pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: tc.refused})...)
+			bundle := pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: good})
+			bundle = append(bundle, pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: tc.refused})...)
 
-			// The file starts as the plain list and gains the scoped one afterwards, which is how
-			// this reaches an operator: a CA decides to start publishing what this module will not
-			// read. The refusal has to be said out loud when it appears, name the CA whose list it
-			// is, and then stop repeating itself while nothing changes — "loaded 3 CRLs" and "loaded
-			// 3 of the 4 you configured" must not be indistinguishable in a log.
-			path := writeFile(t, "bundle.crl", pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: good}))
+			// logged loudly once, naming the CA, and not again while nothing changes
+			path := writeFile(t, "bundle.crl", pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: good}))
 			v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
-			core, logs := observer.New(zapcore.DebugLevel)
-			v.logger = zap.New(core)
+			logs := observeLogs(t, v, zapcore.DebugLevel)
 
 			if err := os.WriteFile(path, bundle, 0o600); err != nil {
 				t.Fatal(err)
@@ -514,12 +458,11 @@ func TestCRLVerifierARefusedListDoesNotCostTheRestOfItsBundle(t *testing.T) {
 				t.Error("the standing refusal should stay visible at debug for whoever is diagnosing it")
 			}
 
-			// What loaded is loaded, and used.
+			// what loaded is used
 			if err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client)); err != nil {
 				t.Errorf("the certificate under the list which loaded was refused anyway: %v", err)
 			}
-			// What only the refused list covered is now uncovered, which is the same answer as never
-			// having had that list at all — not a pass.
+			// what only the refused list covered is uncovered, not admitted
 			err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsToRoot(client))
 			if err == nil {
 				t.Fatal("a chain whose coverage came only from a refused list was admitted")
@@ -533,8 +476,8 @@ func TestCRLVerifierARefusedListDoesNotCostTheRestOfItsBundle(t *testing.T) {
 	t.Run("the order of the lists in one file makes no difference", func(t *testing.T) {
 		good := pki.crl(t, crlOptions{number: 2})
 		scopedList := scoped(pki.rootCert, pki.rootKey)
-		bundle := append(pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: scopedList}),
-			pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: good})...)
+		bundle := append(pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: scopedList}),
+			pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: good})...)
 
 		v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{writeFile(t, "bundle.crl", bundle)}})
 		if err := v.VerifyClientCertificate(rawDER(t, client), pki.chainsFor(client)); err != nil {
@@ -547,14 +490,11 @@ func TestCRLVerifierARefusedListDoesNotCostTheRestOfItsBundle(t *testing.T) {
 	})
 
 	t.Run("a publisher which starts scoping its lists keeps the last good crl", func(t *testing.T) {
-		// The same trade once running: the source now yields nothing usable, so what was last good
-		// keeps its hold. Refusing on it would drop known revocations because a publisher changed
-		// how it exports, and believing the scoped list would invent coverage for everything it
-		// leaves out.
-		path := writeFile(t, "issuing.crl", pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: pki.crl(t, crlOptions{number: 1})}))
+		// once running, a source which yields nothing usable keeps its last good list
+		path := writeFile(t, "issuing.crl", pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: pki.crl(t, crlOptions{number: 1})}))
 		v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
 
-		scopedOnly := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: scoped(pki.issCert, pki.issKey)})
+		scopedOnly := pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: scoped(pki.issCert, pki.issKey)})
 		if err := os.WriteFile(path, scopedOnly, 0o600); err != nil {
 			t.Fatalf("replacing the file: %v", err)
 		}
@@ -569,9 +509,8 @@ func TestCRLVerifierARefusedListDoesNotCostTheRestOfItsBundle(t *testing.T) {
 		}
 	})
 
-	// A source which holds nothing but refused lists is a different matter. Nothing came of it, so
-	// the operator hears about it at config load rather than through every client of that CA.
-	only := writeFile(t, "scoped.crl", pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: scoped(pki.issCert, pki.issKey)}))
+	// a source holding only refused lists fails at config load
+	only := writeFile(t, "scoped.crl", pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: scoped(pki.issCert, pki.issKey)}))
 	err := provisionCRLVerifierExpectError(t, &CRLVerifier{CRLFiles: []string{only}})
 	if err == nil {
 		t.Fatal("a source which yielded no usable list was accepted")
@@ -581,11 +520,8 @@ func TestCRLVerifierARefusedListDoesNotCostTheRestOfItsBundle(t *testing.T) {
 	}
 }
 
-// TestCRLVerifierOneSourceRefusingPartOfItselfIsReportedAndUsed pins what a source which reported a
-// problem and loaded something at the same time looks like. One issuer's list is current and another
-// issuer's went backwards: the load happens, because dropping the current list over an unrelated
-// refusal would open the door that refusal was meant to close — and the report is still made,
-// truthfully, about a source which both failed and was used.
+// One issuer's list is current and another's went backwards: the current
+// one is loaded and the source is still reported as having a problem.
 func TestCRLVerifierOneSourceRefusingPartOfItselfIsReportedAndUsed(t *testing.T) {
 	pki := newCRLTestPKI(t)
 
@@ -595,7 +531,7 @@ func TestCRLVerifierOneSourceRefusingPartOfItselfIsReportedAndUsed(t *testing.T)
 	path := writeFile(t, "bundle.crl", writeCRLPEMBytes(issuing, root))
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
 
-	// The issuing CA publishes again; the root's distribution point serves an older object.
+	// the issuing CA publishes again; the root serves an older object
 	if err := os.WriteFile(path, writeCRLPEMBytes(pki.crl(t, crlOptions{number: 4}),
 		pki.crl(t, crlOptions{issuer: pki.rootCert, signer: pki.rootKey, number: 2})), 0o600); err != nil {
 		t.Fatal(err)
@@ -608,37 +544,24 @@ func TestCRLVerifierOneSourceRefusingPartOfItselfIsReportedAndUsed(t *testing.T)
 	if !strings.Contains(err.Error(), "every configured CRL source reported a problem") {
 		t.Errorf("the report should say this source had a problem, got: %v", err)
 	}
-	// It must not say what did not happen: the current list was loaded, so nothing here may read as
-	// though no source could be used at all.
+	// the report must not claim nothing could be used
 	for _, falseClaim := range []string{"could not be used", "nothing is loaded"} {
 		if strings.Contains(err.Error(), falseClaim) {
 			t.Errorf("the report claims %q, which did not happen: %v", falseClaim, err)
 		}
 	}
 
-	var numbers []int64
-	for _, crl := range v.current().byIssuer[string(pki.issCert.RawSubject)] {
-		if crl.number != nil {
-			numbers = append(numbers, crl.number.Int64())
-		}
-	}
-	slices.Sort(numbers)
+	numbers := serviceNumbers(v.current(), pki.issCert)
 	if len(numbers) != 1 || numbers[0] != 4 {
 		t.Errorf("the current list of the issuer which did not go backwards should be in service, got %v", numbers)
 	}
 }
 
 func TestCRLVerifierAuthorityKeyIDMustMatchTheIssuer(t *testing.T) {
-	// Where a list names the key of the CA it is attributed to, an issuer certificate with another
-	// key id is not the certificate that list came from — usually one CA certificate retired and
-	// another issued under the same subject. Such a list is passed over rather than trusted or
-	// treated as a failure: two keys sharing a name cannot make one's word the other's.
-	//
-	// The list is minted from a copy of the issuing CA certificate carrying a different subject key
-	// id, which is what Go then publishes as the list's authority key id. That leaves exactly one
-	// such extension, as a CA which reissued itself would publish; injecting an extra one onto an
-	// ordinary list would instead test which duplicate Go's parser keeps, since
-	// CreateRevocationList always adds its own.
+	// A list naming a key the issuer certificate does not hold is passed over,
+	// not trusted or failed; usually a CA re-keyed under the same subject.
+	// Minting from a copy of the issuer with another subject key id leaves the
+	// list exactly one authority key id, since CreateRevocationList adds its own.
 	pki := newCRLTestPKI(t)
 	retiredKey := *pki.issCert
 	retiredKey.SubjectKeyId = []byte{0x01, 0x02, 0x03}
@@ -655,22 +578,19 @@ func TestCRLVerifierAuthorityKeyIDMustMatchTheIssuer(t *testing.T) {
 			lists[0].crl.AuthorityKeyId, retiredKey.SubjectKeyId)
 	}
 
-	// The certificate in hand is the one issued after the re-key. The list below it is a genuine
-	// signature by that same CA — which is exactly why the key id has to be what separates them.
+	// the signature is genuine; only the key id separates the two certificates
 	if verdict, why := lists[0].verifiesAgainst(pki.issCert); verdict != verifySkipped {
 		t.Errorf("a list whose authority key id is not the issuer's should be passed over, got %v (%s)", verdict, why)
 	}
 
-	// A CA certificate which says nothing about its own key leaves nothing to compare, and then the
-	// signature decides on its own — which is how every CRL without an authority key id is judged.
+	// an issuer with no subject key id leaves the signature to decide
 	noKeyID := *pki.issCert
 	noKeyID.SubjectKeyId = nil
 	if verdict, why := lists[0].verifiesAgainst(&noKeyID); verdict != verifyOK {
 		t.Errorf("a list signed by this issuer should be relied on, got %v (%s)", verdict, why)
 	}
 
-	// And naming a key which the issuer does hold is ordinary: the check compares, it does not
-	// refuse the presence of an authority key id.
+	// naming a key the issuer does hold is ordinary
 	current, _, err := parseCRLs(pki.crl(t, crlOptions{number: 2}))
 	if err != nil {
 		t.Fatalf("parsing a list which names the issuer's current key: %v", err)
@@ -680,10 +600,65 @@ func TestCRLVerifierAuthorityKeyIDMustMatchTheIssuer(t *testing.T) {
 	}
 }
 
+func TestCRLSignatureVerdictIsRememberedPerIssuer(t *testing.T) {
+	// Signature verdicts are remembered per issuer. The list is damaged after
+	// the first ask to prove the second one did not re-derive the answer.
+	pki := newCRLTestPKI(t)
+	lists, _, err := parseCRLs(pki.crl(t, crlOptions{number: 1}))
+	if err != nil {
+		t.Fatalf("parsing the list: %v", err)
+	}
+	if len(lists) != 1 {
+		t.Fatalf("expected one list, got %d", len(lists))
+	}
+	list := lists[0]
+
+	// concurrent asks share the remembered answers; this also runs under -race
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 25 {
+				if verdict, why := list.verifiesAgainst(pki.issCert); verdict != verifyOK {
+					t.Errorf("a list signed by its issuer should verify, got %v (%s)", verdict, why)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if got := len(list.sigVerdicts); got != 1 {
+		t.Errorf("expected one remembered verdict for one issuer, got %d", got)
+	}
+
+	list.crl.Signature[0] ^= 0xff
+	if verdict, _ := list.verifiesAgainst(pki.issCert); verdict != verifyOK {
+		t.Errorf("the second ask re-worked an answer this issuer was already given")
+	}
+
+	// another issuer is not answered from this one's remembered verdict
+	if verdict, _ := list.verifiesAgainst(pki.rootCert); verdict == verifyOK {
+		t.Errorf("the root was answered from the issuing CA's remembered verdict")
+	}
+
+	// the key id comparison still runs on every ask
+	retiredKey := *pki.issCert
+	retiredKey.SubjectKeyId = []byte{0x01, 0x02, 0x03}
+	if verdict, why := list.verifiesAgainst(&retiredKey); verdict != verifySkipped {
+		t.Errorf("an issuer whose key the list does not name should be passed over, got %v (%s)", verdict, why)
+	}
+
+	// a certificate with no DER cannot key an answer, so it is checked every time
+	bare := *pki.issCert
+	bare.Raw = nil
+	if verdict, _ := list.verifiesAgainst(&bare); verdict == verifyOK {
+		t.Errorf("a certificate with no DER was answered from a remembered verdict")
+	}
+}
+
 func TestCRLVerifierRefreshDelayHonoursNextUpdate(t *testing.T) {
 	pki := newCRLTestPKI(t)
-	// A CRL names its times to the second, so the clock has to be on one too or the expected
-	// delay is off by whatever fraction of a second the test happened to start at.
+	// CRL times are whole seconds
 	now := time.Now().Truncate(time.Second)
 
 	for _, tc := range []struct {
@@ -692,23 +667,19 @@ func TestCRLVerifierRefreshDelayHonoursNextUpdate(t *testing.T) {
 		bound      time.Duration
 		want       time.Duration
 	}{
-		// A CRL which says it changes in two hours is fetched again well before that, not on the
-		// configured interval alone.
+		// refreshed well before nextUpdate, not on the interval alone
 		{name: "short lifetime", nextUpdate: now.Add(time.Hour), bound: time.Hour, want: 12 * time.Minute},
 		{name: "long lifetime is bounded", nextUpdate: now.Add(90 * 24 * time.Hour), bound: time.Hour, want: time.Hour},
-		// Past its nextUpdate the publisher is behind, and polling once a second does not make it
-		// publish faster. A missed CRL is retried on the same cadence as a failed fetch.
+		// past nextUpdate the publisher is behind; retry on the failed-fetch cadence
 		{name: "already expired", nextUpdate: now.Add(-time.Minute), bound: time.Hour, want: crlRetryOnFailure},
-		// A list which claims to expire no later than it started has no lifetime to follow. One
-		// fetch per second would be a denial of service against the CA, and would not help.
+		// no lifetime to follow; polling every second would hammer the CA
 		{name: "lifetime runs backwards", nextUpdate: now.Add(-2 * time.Hour), bound: time.Hour, want: crlRetryOnFailure},
 		{name: "lifetime runs backwards under a short interval", nextUpdate: now.Add(-2 * time.Hour), bound: 30 * time.Second, want: 30 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := crlOptions{number: 1, thisUpdate: now.Add(-time.Hour), nextUpdate: tc.nextUpdate}
 			if opts.nextUpdate.Before(opts.thisUpdate) {
-				// crypto/x509 will not mint a list which expires before it began, so a CA which
-				// published one cannot have used the standard library to do it. Write it by hand.
+				// crypto/x509 will not mint a list which expires before it began
 				opts.omitNumber = true
 			}
 			crls, _, err := parseCRLs(pki.crl(t, opts))
@@ -734,8 +705,7 @@ func TestCRLVerifierRefreshDelayHonoursNextUpdate(t *testing.T) {
 }
 
 func TestSerialKeyIsCanonical(t *testing.T) {
-	// A serial is a number, so the same number written with a leading zero byte is the same
-	// revocation. Padding must not let a listing be missed.
+	// the same number with a leading zero byte is the same serial
 	padded := new(big.Int).SetBytes([]byte{0x00, 0x01, 0x02})
 	if serialKey(padded) != serialKey(big.NewInt(0x0102)) {
 		t.Errorf("the same serial with padding is a different key: %q", serialKey(padded))
@@ -750,7 +720,7 @@ func TestRevocationReasonNames(t *testing.T) {
 		code int
 		want string
 	}{
-		{0, ""}, // unspecified: the entry says enough on its own
+		{0, ""}, // unspecified
 		{1, "key compromise"},
 		{2, "CA compromise"},
 		{3, "affiliation changed"},

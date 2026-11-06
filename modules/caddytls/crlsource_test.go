@@ -51,7 +51,7 @@ func TestCRLVerifierURLSource(t *testing.T) {
 		{
 			name: "pem",
 			handler: func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write(pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: goodCRL}))
+				_, _ = w.Write(pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: goodCRL}))
 			},
 		},
 		{
@@ -91,8 +91,7 @@ func TestCRLVerifierURLSource(t *testing.T) {
 
 	t.Run("the request is a plain get with an empty body", func(t *testing.T) {
 		var got http.HandlerFunc = func(w http.ResponseWriter, r *http.Request) {
-			// A client which sent a body would be doing something no CRL fetch should do, and
-			// net/http hands out a non-nil body either way, so the body has to be read to know.
+			// net/http always hands out a non-nil body, so read it to know it is empty
 			var body bytes.Buffer
 			if _, err := body.ReadFrom(r.Body); err != nil {
 				t.Errorf("reading the request body: %v", err)
@@ -126,7 +125,7 @@ func TestCRLVerifierRedirectsAreBounded(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a redirect loop to fail the load")
 	}
-	// One request for the distribution point itself and one per redirect followed.
+	// one request for the distribution point and one per redirect followed
 	if got := atomic.LoadInt64(&hops); got > maxCRLRedirects+1 {
 		t.Errorf("made %d requests, expected no more than %d", got, maxCRLRedirects+1)
 	}
@@ -137,8 +136,7 @@ func TestCRLVerifierRedirectPolicy(t *testing.T) {
 	path := writeCRLDER(t, "issuing.crl", pki.crl(t, crlOptions{number: 1}))
 	v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
 
-	// The fetches are made with a clone of the default transport. Sharing the process-wide one
-	// would mean changing Caddy's own HTTP clients from inside a TLS option.
+	// fetches use a clone of the default transport, not the process-wide one
 	if v.client.Transport == http.DefaultTransport {
 		t.Error("the module shares http.DefaultTransport with the rest of Caddy")
 	}
@@ -152,9 +150,8 @@ func TestCRLVerifierRedirectPolicy(t *testing.T) {
 		return &http.Request{Method: "GET", URL: u}
 	}
 
-	// Go calls this only when a redirect is about to be followed, with via holding the requests
-	// already made: the first redirect arrives with one request in it, never zero. So a fetch may be
-	// redirected maxCRLRedirects times and the next hop after that is refused.
+	// Go calls CheckRedirect with via holding the requests already made, so
+	// the first redirect arrives with one entry, never zero
 	var via []*http.Request
 	for hop := 1; hop <= maxCRLRedirects+1; hop++ {
 		via = append(via, request("https://crl.example/via"))
@@ -172,11 +169,8 @@ func TestCRLVerifierRedirectPolicy(t *testing.T) {
 	}
 }
 
-// TestCRLVerifierURLCredentialsAreRedacted covers every way a distribution point's basic-auth
-// credentials can reach an operator: through this module's own message, through Go's http client,
-// and through the name a source is logged under. The password is the obvious half; the username
-// goes too, because Go masks only the password and would otherwise leave the name in every line
-// about that source.
+// Basic-auth credentials must not reach an operator through errors or log
+// names. Go masks only the password, so the username goes too.
 func TestCRLVerifierURLCredentialsAreRedacted(t *testing.T) {
 	const secret = "s3cr3t-word"
 
@@ -185,9 +179,8 @@ func TestCRLVerifierURLCredentialsAreRedacted(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// A port nothing listens on: the error here is net/http's own, which quotes the URL it
-	// requested. That rendering is masked by Go and so is not the string this module was
-	// configured with, which is why redaction cannot work by replacing what it was given.
+	// net/http's own error quotes the URL with the password masked by Go, so
+	// redaction cannot work by replacing the configured string
 	unreachable := "http://reader:" + secret + "@127.0.0.1:1/crl"
 
 	for _, tc := range []struct {
@@ -209,10 +202,9 @@ func TestCRLVerifierURLCredentialsAreRedacted(t *testing.T) {
 		})
 	}
 
-	// The same URL is written into the log by two helpers on a reload failure, where no error
-	// reaches an operator's terminal at all.
+	// display and redact write the URL into the log on a reload failure
 	t.Run("what a source calls itself", func(t *testing.T) {
-		src := crlSource{kind: "url", location: unreachable}
+		src := crlURLSource(unreachable)
 		assertNoCredentials(t, src.display(), secret)
 		if !strings.Contains(src.display(), "/crl") {
 			t.Errorf("the display name should still identify the source, got: %s", src.display())
@@ -220,29 +212,26 @@ func TestCRLVerifierURLCredentialsAreRedacted(t *testing.T) {
 	})
 
 	t.Run("what an error about it says", func(t *testing.T) {
-		src := crlSource{kind: "url", location: unreachable}
+		src := crlURLSource(unreachable)
 		for _, raw := range []error{
-			// A library which echoed the URL exactly as configured.
+			// the URL exactly as configured
 			errors.New(`Get "` + unreachable + `": remote error: tls: handshake failure`),
-			// What Go's http client actually produces, password masked by itself.
+			// what Go's http client produces, password masked by itself
 			errors.New(`Get "http://reader:xxx@127.0.0.1:1/crl": dial tcp 127.0.0.1:1: connect: connection refused`),
-			// A message in which the URL appears more than once, and one without credentials at all.
+			// the URL more than once, and once without credentials
 			errors.New(`Get "http://reader:xxx@127.0.0.1:1/crl": after 3 redirects to http://reader:s3cr3t-word@127.0.0.1:1/crl`),
 		} {
-			got := src.redactErr(raw).Error()
+			got := src.redact(raw).Error()
 			assertNoCredentials(t, got, secret)
 			if !strings.Contains(got, "127.0.0.1:1/crl") {
 				t.Errorf("the error should still say which source it is about, got: %s", got)
 			}
 		}
 
-		// A password which contains an unescaped @ — the shape which would leave the tail of a
-		// secret behind in a pattern that stops at the first separator. url.Parse accepts an @
-		// inside userinfo and takes the last one as the separator, so this URL is not refused: it
-		// is fetched with reader:pa@ss-word as its credentials, which makes redacting all of it
-		// the only thing standing between a misconfigured source and a secret in the log.
+		// url.Parse takes the last @ in userinfo as the separator, so a password
+		// with an unescaped @ is fetched as-is and must be redacted whole
 		atSecret := errors.New(`Get "http://reader:pa` + "@" + `ss-word@127.0.0.1:1/crl": connection refused`)
-		got := src.redactErr(atSecret).Error()
+		got := src.redact(atSecret).Error()
 		if strings.Contains(got, "reader") || strings.Contains(got, "ss-word") {
 			t.Errorf("part of a password containing @ survived redaction: %s", got)
 		}
@@ -250,49 +239,42 @@ func TestCRLVerifierURLCredentialsAreRedacted(t *testing.T) {
 			t.Errorf("redaction took the host with it: %s", got)
 		}
 
-		// An error which carries no credentials is passed through as it came, not rewritten.
+		// an error with no credentials is passed through unchanged
 		plain := errors.New("connection reset by peer")
-		if got := src.redactErr(plain); got.Error() != plain.Error() {
+		if got := src.redact(plain); got.Error() != plain.Error() {
 			t.Errorf("an error without credentials was altered: %v", got)
 		}
 	})
 
-	// Redaction is textual, so what it must not do is as important as what it must do: an error
-	// which mentions an @ for some other reason is a common thing to have to read, and one with a
-	// host mangled out of it is useless. These are the shapes which look like credentials to a
-	// pattern which is not careful about requiring a scheme in front of them.
+	// an @ which is not in a URL's userinfo must be left alone
 	t.Run("what a message about something else says", func(t *testing.T) {
-		src := crlSource{kind: "url", location: unreachable}
+		src := crlURLSource(unreachable)
 		for _, msg := range []string{
-			// An @ which belongs to an address, not to a URL.
+			// an @ in an address, not a URL
 			`open /var/crls/team@ok.crl: no such file or directory`,
 			`the alert went to ops@example.com but nobody read it`,
 			`x509: certificate signed by unknown authority (someone@invalid)`,
-			// A URL with nothing in front of its host to remove.
+			// a URL with no userinfo
 			`Get "http://127.0.0.1:8080/crl": dial tcp: connection refused`,
 			`redirect from http://one.invalid/crl to http://two.invalid/crl`,
-			// An @ inside a query string or a path, where it is a value rather than a separator.
-			// An authority ends at the first / ? #, so there is nothing before these which could be
-			// read as credentials and the redactor has to leave them exactly as they came.
+			// an @ in a query or path is a value, not a separator
 			`Get "http://127.0.0.1:8080/crl?issuer=team%40ok.net": server misbehaving`,
 			`open "http://crl.invalid/team@ok.crl": not found`,
 			`the alert went to crl-admin@teamok.net`,
-			// An address with no authority at all, which is what a scheme-relative link looks like.
+			// a scheme-relative link
 			`followed //crl.invalid/team@ok.crl and got nothing`,
 		} {
-			if got := src.redactErr(errors.New(msg)); got.Error() != msg {
+			if got := src.redact(errors.New(msg)); got.Error() != msg {
 				t.Errorf("a message with no credentials in it was altered:\n got: %s\nwant: %s", got, msg)
 			}
 		}
 	})
 
 	t.Run("what a message about two urls says", func(t *testing.T) {
-		// A redirect or a proxy error can name more than one URL. The one with credentials loses
-		// them and the one without is left exactly as it was, since a host removed from a message
-		// about a redirect is a message which no longer says where the request went.
-		src := crlSource{kind: "url", location: unreachable}
+		// the URL with credentials loses them; the one without is untouched
+		src := crlURLSource(unreachable)
 		msg := `Get "http://crl.invalid/crl" redirected to http://reader:` + secret + `@127.0.0.1:1/crl`
-		got := src.redactErr(errors.New(msg)).Error()
+		got := src.redact(errors.New(msg)).Error()
 		assertNoCredentials(t, got, secret)
 		if !strings.Contains(got, `http://crl.invalid/crl`) {
 			t.Errorf("the URL without credentials was rewritten: %s", got)
@@ -301,9 +283,8 @@ func TestCRLVerifierURLCredentialsAreRedacted(t *testing.T) {
 			t.Errorf("the URL with credentials lost more than its credentials: %s", got)
 		}
 
-		// A username alone is still something the operator typed, and a message which keeps it
-		// identifies the account as well as the host does.
-		userOnly := src.redactErr(errors.New(`Get "http://reader@127.0.0.1:1/crl": connection refused`)).Error()
+		// a username alone still identifies the account
+		userOnly := src.redact(errors.New(`Get "http://reader@127.0.0.1:1/crl": connection refused`)).Error()
 		if strings.Contains(userOnly, "reader@") {
 			t.Errorf("a username survived redaction: %s", userOnly)
 		}
@@ -313,10 +294,8 @@ func TestCRLVerifierURLCredentialsAreRedacted(t *testing.T) {
 	})
 
 	t.Run("an url which does not parse", func(t *testing.T) {
-		// An unescaped space is among the reasons a URL would not parse. Provisioning refuses it by
-		// position without describing it, so there is nothing to leak in that message; and because
-		// redaction is textual rather than something done to a parsed URL, even this string can be
-		// made safe — which matters for anything else which might echo it.
+		// provisioning refuses an unparsable URL by position without echoing it;
+		// redaction is textual, so even this string can be made safe
 		unparsable := "http://reader:" + secret + "@exa mple.invalid/crl"
 		err := provisionCRLVerifierExpectError(t, &CRLVerifier{CRLURLs: []string{unparsable}})
 		if err == nil {
@@ -334,10 +313,9 @@ func TestCRLVerifierURLCredentialsAreRedacted(t *testing.T) {
 	})
 
 	t.Run("a file path is not a url", func(t *testing.T) {
-		// Only URLs are rewritten; a path is shown as configured, and one which happens to contain
-		// an @ must not be mangled into something which no longer names the file.
-		src := crlSource{kind: "file", location: "/var/crls/team@ok.crl"}
-		if got := src.display(); got != src.location {
+		// only URLs are rewritten; a path with an @ must not be mangled
+		src := crlFileSource("/var/crls/team@ok.crl")
+		if got := src.display(); got != src.key() {
 			t.Errorf("a file source was rewritten: %s", got)
 		}
 	})
@@ -360,7 +338,7 @@ func TestCRLVerifierUnusableSource(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeFile(t, "issuing.crl", tc.contents())
-			// Provisioning must fail rather than start a verifier which admits everything.
+			// fail rather than start a verifier which admits everything
 			if err := provisionCRLVerifierExpectError(t, &CRLVerifier{CRLFiles: []string{path}}); err == nil {
 				t.Error("expected provisioning to fail when no CRL could be loaded")
 			}
@@ -387,9 +365,7 @@ func TestCRLVerifierUnusableSource(t *testing.T) {
 	})
 
 	t.Run("one good source and one broken one is refused at config load", func(t *testing.T) {
-		// A config load reports every mistake it can find, including a distribution point which
-		// moved. Running on the subset which happened to load would look exactly like working
-		// revocation checking while some CAs in the pool are not checked at all.
+		// running on the subset which loaded would hide the CAs not being checked
 		path := writeCRLDER(t, "issuing.crl", goodCRL)
 		missing := filepath.Join(t.TempDir(), "absent.crl")
 		err := provisionCRLVerifierExpectError(t, &CRLVerifier{CRLFiles: []string{path, missing}})
@@ -402,8 +378,7 @@ func TestCRLVerifierUnusableSource(t *testing.T) {
 	})
 
 	t.Run("a source which breaks later keeps its last good crl", func(t *testing.T) {
-		// Once running, the trade is the other way round: dropping known revocations because a
-		// distribution point is briefly unreachable opens the door instead of closing it.
+		// once running, a brief outage must not drop known revocations
 		path := writeCRLDER(t, "issuing.crl", goodCRL)
 		v := provisionCRLVerifier(t, &CRLVerifier{CRLFiles: []string{path}})
 		if err := os.Remove(path); err != nil {
@@ -432,8 +407,7 @@ func TestCRLVerifierUnusableSource(t *testing.T) {
 		}
 	})
 
-	// A negative duration is not "unset": it would fail every fetch rather than mean "use the
-	// default", so it is refused instead of quietly defaulted.
+	// a negative timeout would fail every fetch, so it is refused rather than defaulted
 	t.Run("a negative timeout is refused", func(t *testing.T) {
 		if err := provisionCRLVerifierExpectError(t, &CRLVerifier{
 			CRLFiles: []string{writeCRLDER(t, "issuing.crl", goodCRL)},
@@ -442,4 +416,32 @@ func TestCRLVerifierUnusableSource(t *testing.T) {
 			t.Error("a negative timeout was accepted")
 		}
 	})
+}
+
+// endlessBody is a distribution point which never finishes sending.
+type endlessBody struct{ read int64 }
+
+func (e *endlessBody) Read(p []byte) (int, error) {
+	clear(p)
+	e.read += int64(len(p))
+	return len(p), nil
+}
+
+func TestCRLVerifierRefusesABodyLongerThanTheCap(t *testing.T) {
+	body := &endlessBody{}
+	raw, err := readCapped(body)
+	if err == nil {
+		t.Fatalf("a body which never ends was accepted after %d bytes", len(raw))
+	}
+	if !errors.Is(err, errCRLTooLarge) {
+		t.Errorf("the refusal should name the limit it hit, got: %v", err)
+	}
+	if raw != nil {
+		t.Errorf("a refused body was handed back anyway, %d bytes of it", len(raw))
+	}
+	// the reader stops just past the cap, not at the end of a body which has none
+	var want int64 = defaultCRLMaxSize + 1
+	if body.read != want {
+		t.Errorf("the reader took %d bytes from a source which never stops, want no more than %d", body.read, want)
+	}
 }

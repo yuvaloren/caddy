@@ -23,21 +23,18 @@ import (
 	"strings"
 )
 
+// crlSet is the loaded CRLs indexed by issuer.
 type crlSet struct {
-	// byIssuer maps the DER-encoded subject of an issuer to the CRLs which name that issuer,
-	// newest first. The authoritative list for a certificate is therefore the first one which
-	// can be relied on for it, and older ones are only fallbacks: revocations are deliberately
-	// not unioned across them, so that removing a serial from a CRL actually removes it.
+	// byIssuer maps the DER-encoded issuer subject to its CRLs, newest
+	// first. Only the first usable one is consulted; revocations are
+	// not unioned across CRLs.
 	byIssuer map[string][]*parsedCRL
 }
 
-// distinctLists keeps the first copy of each distinct set of bytes. The same list can be handed over
-// more than once — an object repeated in a bundle, two sources pointing at one distribution point, or
-// an earlier parse standing in beside the fresh copy of itself, which is what happens on every refresh
-// while a refused list sits beside it. buildCRLSet drops duplicates when indexing, so admissions stay
-// correct either way; this is about what gets *remembered*: lastGood is rebuilt from this list each
-// time, and without it a source holding one stale sibling grows by a whole parsed CRL — its entries map
-// and raw bytes included — on every retry, quietly, forever.
+// distinctLists drops CRLs with identical bytes. The same CRL can arrive
+// more than once (repeated in a bundle, or two sources for one URL), and
+// lastGood is rebuilt from this list, so without this a source would grow
+// by one parsed CRL per retry.
 func distinctLists(crls []*parsedCRL) []*parsedCRL {
 	seen := make(map[[sha256.Size]byte]bool, len(crls))
 	out := make([]*parsedCRL, 0, len(crls))
@@ -52,8 +49,8 @@ func distinctLists(crls []*parsedCRL) []*parsedCRL {
 	return out
 }
 
-// buildCRLSet indexes CRLs by issuer, dropping duplicates and ordering each issuer's list
-// newest first.
+// buildCRLSet indexes CRLs by issuer, dropping duplicates and ordering
+// each issuer's CRLs newest first.
 func buildCRLSet(crls []*parsedCRL) *crlSet {
 	if len(crls) == 0 {
 		return nil
@@ -61,8 +58,6 @@ func buildCRLSet(crls []*parsedCRL) *crlSet {
 	set := &crlSet{byIssuer: make(map[string][]*parsedCRL)}
 	seen := make(map[[sha256.Size]byte]bool, len(crls))
 	for _, crl := range crls {
-		// The same object can arrive twice — from two sources pointing at one distribution point,
-		// or twice in one bundle — and a duplicate would be counted as a second list to rank.
 		digest := crl.contentDigest()
 		if seen[digest] {
 			continue
@@ -72,10 +67,7 @@ func buildCRLSet(crls []*parsedCRL) *crlSet {
 	}
 	for _, list := range set.byIssuer {
 		slices.SortStableFunc(list, func(a, b *parsedCRL) int {
-			// cRLNumber is the CA's own statement of which list is later, so it comes first; a
-			// list which carries none can only be ordered by when it says it took effect, and it
-			// sorts after the numbered ones, which can be ordered with certainty. Two lists which
-			// agree on both say the same thing about order, so their arrangement does not matter.
+			// cRLNumber first; a CRL without one sorts after the numbered ones
 			if cmp := compareNumbers(a.number, b.number); cmp != 0 {
 				return -cmp
 			}
@@ -85,23 +77,17 @@ func buildCRLSet(crls []*parsedCRL) *crlSet {
 	return set
 }
 
-// lookup returns the CRLs which claim the issuer of cert, anchored on issuer. An empty result means
-// no loaded CRL claims this certificate's issuer. A list whose issuer name is encoded differently
-// from the certificate's is still found, as long as exactly one loaded CA renders that name; what
-// ties such a list to its CA is the signature, checked by the caller.
+// lookup returns the CRLs claiming the issuer of cert. The caller still
+// has to check the signature; this only matches names.
 func (s *crlSet) lookup(cert, issuer *x509.Certificate) []*parsedCRL {
 	if issuer == nil || !bytes.Equal(cert.RawIssuer, issuer.RawSubject) {
-		// Without the issuer certificate there is nothing to anchor a CRL on, so no list can
-		// be relied on for this certificate even if one claims its name.
 		return nil
 	}
 	if crls := s.byIssuer[string(issuer.RawSubject)]; len(crls) > 0 {
 		return crls
 	}
-	// Some CAs re-encode the issuer name when signing a CRL, which is legal but means the DER
-	// encodings differ. Fall back to the rendered name, and only where it identifies one CA:
-	// guessing between two DNs which print the same is how a revocation gets attributed to the
-	// wrong CA, so a name more than one loaded issuer answers to finds nothing.
+	// some CAs re-encode the issuer name when signing a CRL, so fall back
+	// to the rendered name, but only if it identifies exactly one CA
 	var found []*parsedCRL
 	name := cert.Issuer.String()
 	for _, crls := range s.byIssuer {
@@ -116,8 +102,8 @@ func (s *crlSet) lookup(cert, issuer *x509.Certificate) []*parsedCRL {
 	return found
 }
 
-// newest returns the loaded lists grouped by issuer — newest first within each group, the groups
-// ordered by issuer name — for logging.
+// newest returns the loaded CRLs grouped by issuer, newest first, in a
+// stable order for logging.
 func (s *crlSet) newest() [][]*parsedCRL {
 	lists := make([][]*parsedCRL, 0, len(s.byIssuer))
 	for _, list := range s.byIssuer {
@@ -127,14 +113,13 @@ func (s *crlSet) newest() [][]*parsedCRL {
 		if cmp := strings.Compare(a[0].issuerName, b[0].issuerName); cmp != 0 {
 			return cmp
 		}
-		// Two CAs whose names print the same but encode differently would otherwise trade places
-		// between reloads, and the line about what changed would fire on nothing having changed.
+		// two CAs can print the same name with different encodings
 		return strings.Compare(a[0].issuerKey, b[0].issuerKey)
 	})
 	return lists
 }
 
-// issuerNames lists the CAs which have a CRL loaded, for diagnostics.
+// issuerNames lists the CAs which have a CRL loaded.
 func (s *crlSet) issuerNames() []string {
 	names := make([]string, 0, len(s.byIssuer))
 	for _, list := range s.byIssuer {
@@ -144,12 +129,7 @@ func (s *crlSet) issuerNames() []string {
 	return names
 }
 
-// coveredBy words issuerNames for an error message, including the case where there is nothing to
-// name. That case is reachable: a source whose last accepted list carried no number then serves a
-// numbered one below its mark has nothing to stand in — an un-numbered list cannot be shown to be
-// above anything — and with no other source contributing, the set in service is empty. A refusal
-// ending in "loaded CRLs cover:" with nothing after it would read as a broken sentence rather than as
-// the state being described.
+// coveredBy words issuerNames for an error message.
 func (s *crlSet) coveredBy() string {
 	names := s.issuerNames()
 	if len(names) == 0 {
@@ -158,14 +138,11 @@ func (s *crlSet) coveredBy() string {
 	return "loaded CRLs cover: " + strings.Join(names, ", ")
 }
 
-// summary describes the loaded set compactly, so that a refresh can tell whether anything
-// changed since the last one.
+// summary describes the loaded set, so a reload can tell whether anything
+// changed.
 func (s *crlSet) summary() string {
 	var sb strings.Builder
 	for _, list := range s.newest() {
-		// Every loaded list, not just the newest per issuer: where two sources carry lists for one
-		// CA, a change in the one which is not authoritative still belongs in the line which says
-		// what the module is holding.
 		for _, crl := range list {
 			fmt.Fprintf(&sb, "%s|number=%s|thisUpdate=%d|nextUpdate=%d\n",
 				crl.issuerName, crl.numberText(), crl.thisUpdate.Unix(), crl.nextUpdate.Unix())

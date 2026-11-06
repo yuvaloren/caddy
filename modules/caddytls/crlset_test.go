@@ -27,9 +27,8 @@ import (
 func TestCRLVerifierSetIgnoresDuplicates(t *testing.T) {
 	pki := newCRLTestPKI(t)
 
-	// The same list named by two sources is one list, and it must not be counted twice in the
-	// summary an operator is given at startup.
-	pemBundle := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: pki.crl(t, crlOptions{number: 1})})
+	// the same list from two sources is one list
+	pemBundle := pem.EncodeToMemory(&pem.Block{Type: pemTypeCRL, Bytes: pki.crl(t, crlOptions{number: 1})})
 	pemBundle = append(pemBundle, pemBundle...)
 	crls, _, err := parseCRLs(pemBundle)
 	if err != nil {
@@ -49,9 +48,8 @@ func TestCRLVerifierSetIgnoresDuplicates(t *testing.T) {
 }
 
 func TestCRLVerifierIssuerNameFallback(t *testing.T) {
-	// Some CAs re-encode the issuer name when signing a CRL, which is legal: two DER encodings of
-	// one rendered name. The lookup keys on the encoding and falls back to the rendering only
-	// where that identifies exactly one CA.
+	// two legal DER encodings of one issuer name; the lookup keys on the encoding and
+	// falls back to the rendered name only where that identifies exactly one CA
 	const commonName = "Cross-Encoded Test CA"
 	cnOID := asn1.ObjectIdentifier{2, 5, 4, 3}
 
@@ -63,8 +61,8 @@ func TestCRLVerifierIssuerNameFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshaling a printable name: %v", err)
 	}
-	// Written out as a UTF8String rather than marshaled, because encoding/asn1 re-encodes any
-	// name which happens to fit a PrintableString as one, and that difference is the point.
+	// written by hand: encoding/asn1 re-encodes anything that fits a PrintableString
+	// as one
 	utf8Value := derElement(0x0C, []byte(commonName))
 	utf8DER, err := asn1.Marshal(pkix.RDNSequence{{{Type: cnOID, Value: asn1.RawValue{FullBytes: utf8Value}}}})
 	if err != nil {
@@ -97,8 +95,7 @@ func TestCRLVerifierIssuerNameFallback(t *testing.T) {
 	})
 
 	t.Run("two ca names which render the same", func(t *testing.T) {
-		// Two distinct issuers whose rendered names collide: guessing between them is how a
-		// revocation gets attributed to the wrong CA, so neither is reachable by name.
+		// two issuers whose rendered names collide: neither is reachable by name
 		set := buildCRLSet([]*parsedCRL{crlFor(utf8DER, []byte("a")), crlFor(printableDER, []byte("b"))})
 
 		cert := &x509.Certificate{RawIssuer: printableDER, Issuer: pkix.Name{CommonName: commonName}}
@@ -107,8 +104,7 @@ func TestCRLVerifierIssuerNameFallback(t *testing.T) {
 			t.Errorf("the exact encoding should still be found without guessing, got %d candidates", len(crls))
 		}
 
-		// A third encoding of the same name matches neither key exactly, so only the rendered
-		// name could resolve it — and that is ambiguous, which must not be guessed at.
+		// a third encoding matches neither key, and the rendered name is ambiguous
 		thirdValue := derElement(0x16, []byte(commonName)) // IA5String
 		thirdDER, err := asn1.Marshal(pkix.RDNSequence{{{Type: cnOID, Value: asn1.RawValue{FullBytes: thirdValue}}}})
 		if err != nil {
@@ -131,8 +127,7 @@ func TestCRLVerifierIssuerNameFallback(t *testing.T) {
 	})
 
 	t.Run("no issuer certificate in the chain", func(t *testing.T) {
-		// Nothing can be relied on for a certificate whose issuing certificate is not in the
-		// chain: there would be no key to check a CRL's signature against.
+		// without the issuer certificate there is no key to check a CRL's signature against
 		set := buildCRLSet([]*parsedCRL{crlFor(printableDER, []byte("a"))})
 		cert := &x509.Certificate{RawIssuer: printableDER, Issuer: pkix.Name{CommonName: commonName}}
 		if crls := set.lookup(cert, nil); len(crls) != 0 {
@@ -140,10 +135,8 @@ func TestCRLVerifierIssuerNameFallback(t *testing.T) {
 		}
 	})
 
-	// What the fallback exists for: a list which names its CA in an equivalent but different
-	// encoding still revokes. It is signed over the name as written by the real CA's key, so a
-	// signature check against the issuer certificate from the chain has to accept it too — and a
-	// lookup which found the list by name must not then refuse it for not matching by DER.
+	// a list naming its CA in a different encoding is signed by the real key, so it
+	// must pass the signature check and revoke
 	t.Run("a revocation reached through the fallback is enforced", func(t *testing.T) {
 		key, ca := mintCA(t, commonName, caPair{}, nil)
 		alt := *ca
